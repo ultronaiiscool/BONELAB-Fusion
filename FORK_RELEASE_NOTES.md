@@ -22,6 +22,8 @@ The preferred token source is:
 
 Fusion trims whitespace, rejects an empty token, caches the result, shares one load among concurrent callers, completes callbacks on the Melon/Unity coroutine path, and never logs the token. When the file is missing or invalid, Fusion falls back to its normal BONELAB mod.io settings. `FusionTokenBridge.dll` is not required and is not loaded or embedded.
 
+Peer mod-info lookups use a 15-second bounded window with reliable resends and remove expired callbacks. Once a mod/file ID is known, mod.io metadata and content requests retry transient connection/server failures up to three times. Failure diagnostics include only the public mod/file IDs and HTTP status—not the access token—and missing content lengths no longer abort an otherwise valid download.
+
 ## Installation
 
 1. Exit BONELAB.
@@ -41,4 +43,4 @@ Exit BONELAB, remove the new DLL, restore the backed-up `LabFusion.dll`, and res
 
 ## Validation boundary
 
-The source builds against a real BONELAB/MelonLoader IL2CPP reference set, and the 31-scenario lifecycle/token simulation harness passes. Native Steam behavior still requires the real-game validation procedure above; a managed build and simulation cannot prove that every native driver/runtime combination is crash-free.
+The source builds against a real BONELAB/MelonLoader IL2CPP reference set, and the 33-scenario lifecycle/token simulation harness passes. Native Steam behavior still requires the real-game validation procedure above; a managed build and simulation cannot prove that every native driver/runtime combination is crash-free.

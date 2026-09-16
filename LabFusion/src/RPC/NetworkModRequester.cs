@@ -12,6 +12,9 @@ namespace LabFusion.RPC;
 
 public static class NetworkModRequester
 {
+    private const float RequestTimeoutSeconds = 15f;
+    private const float RequestRetrySeconds = 3f;
+
     public struct ModCallbackInfo
     {
         public ModIOFile ModFile;
@@ -68,28 +71,38 @@ public static class NetworkModRequester
         float elapsed = 0f;
         bool receivedCallback = false;
 
-        RequestMod(new ModRequestInfo()
+        var request = new ModRequestInfo()
         {
             Target = installInfo.Target,
             Barcode = installInfo.Barcode,
             ModCallback = OnModInfoReceived,
-        });
+        };
+
+        var trackerId = RequestMod(request);
+        float nextRetry = RequestRetrySeconds;
 
         // Wait for timeout
-        while (!receivedCallback && elapsed < 5f)
+        while (!receivedCallback && elapsed < RequestTimeoutSeconds)
         {
             elapsed += TimeReferences.DeltaTime;
+
+            if (elapsed >= nextRetry && elapsed < RequestTimeoutSeconds)
+            {
+                SendRequest(request, trackerId);
+                nextRetry += RequestRetrySeconds;
+            }
+
             yield return null;
         }
 
         // No callback means this request timed out
         if (!receivedCallback)
         {
-#if DEBUG
-            FusionLogger.Warn($"Mod request for {installInfo.Barcode} timed out.");
-#endif
+            FusionLogger.Warn($"Mod info request for {installInfo.Barcode} from player {installInfo.Target} timed out after {RequestTimeoutSeconds:0} seconds.");
 
             installInfo.FinishDownloadCallback?.Invoke(DownloadCallbackInfo.FailedCallback);
+
+            _callbackQueue.Remove(trackerId);
 
             // Remove the callbacks incase it gets received very late
             installInfo.BeginDownloadCallback = null;
@@ -131,7 +144,7 @@ public static class NetworkModRequester
         }
     }
 
-    public static void RequestMod(ModRequestInfo info)
+    public static uint RequestMod(ModRequestInfo info)
     {
         uint trackerId = _lastTrackedRequest++;
 
@@ -140,7 +153,12 @@ public static class NetworkModRequester
             _callbackQueue.Add(trackerId, info.ModCallback);
         }
 
-        // Send the request to the server
+        SendRequest(info, trackerId);
+        return trackerId;
+    }
+
+    private static void SendRequest(ModRequestInfo info, uint trackerId)
+    {
         var data = new ModInfoRequestData()
         {
             Barcode = info.Barcode,

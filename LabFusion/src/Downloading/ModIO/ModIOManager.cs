@@ -12,6 +12,8 @@ namespace LabFusion.Downloading.ModIO;
 
 public static class ModIOManager
 {
+    private const int RequestAttempts = 3;
+
     public static ModIOModTarget GetTargetFromListing(ModListing listing)
     {
         if (listing == null)
@@ -63,77 +65,115 @@ public static class ModIOManager
         using HttpClient client = new(handler);
         client.DefaultRequestHeaders.Add("Authorization", "Bearer " + token);
 
-        // Read the mod json
-        Task<Stream> streamTask;
+        HttpResponseMessage response = null;
 
-        // Handle any errors by running the callback as a failure
-        try
+        for (var attempt = 1; attempt <= RequestAttempts; attempt++)
         {
-            streamTask = client.GetStreamAsync(url);
+            Task<HttpResponseMessage> responseTask;
+            try
+            {
+                responseTask = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            }
+            catch (Exception e)
+            {
+                FusionLogger.LogException($"starting mod.io metadata request for mod {new Uri(url).Segments[^1]} (attempt {attempt}/{RequestAttempts})", e);
+                continue;
+            }
+
+            while (!responseTask.IsCompleted)
+            {
+                yield return null;
+            }
+
+            if (!responseTask.IsCompletedSuccessfully)
+            {
+                FusionLogger.LogException($"requesting mod.io metadata (attempt {attempt}/{RequestAttempts})", responseTask.Exception);
+                continue;
+            }
+
+            var candidate = responseTask.Result;
+            if (candidate.IsSuccessStatusCode)
+            {
+                response = candidate;
+                break;
+            }
+
+            FusionLogger.Warn($"mod.io metadata request returned HTTP {(int)candidate.StatusCode} (attempt {attempt}/{RequestAttempts}).");
+            candidate.Dispose();
+
+            if ((int)candidate.StatusCode < 500)
+            {
+                break;
+            }
         }
-        catch (Exception e)
-        {
-            FusionLogger.LogException("getting stream from HttpClient", e);
 
+        if (response == null)
+        {
             modCallback?.Invoke(ModCallbackInfo.FailedCallback);
             yield break;
         }
 
-        // Wait for completion
-        while (!streamTask.IsCompleted)
+        using (response)
         {
-            yield return null;
+            var streamTask = response.Content.ReadAsStreamAsync();
+
+            while (!streamTask.IsCompleted)
+            {
+                yield return null;
+            }
+
+            if (!streamTask.IsCompletedSuccessfully)
+            {
+                FusionLogger.LogException("reading mod.io metadata response", streamTask.Exception);
+                modCallback?.Invoke(ModCallbackInfo.FailedCallback);
+                yield break;
+            }
+
+            Task<string> jsonTask;
+
+            try
+            {
+                jsonTask = new StreamReader(streamTask.Result).ReadToEndAsync();
+            }
+            catch (Exception e)
+            {
+                FusionLogger.LogException("reading mod.io mod stream", e);
+
+                modCallback?.Invoke(ModCallbackInfo.FailedCallback);
+                yield break;
+            }
+
+            while (!jsonTask.IsCompleted)
+            {
+                yield return null;
+            }
+
+            if (!jsonTask.IsCompletedSuccessfully)
+            {
+                FusionLogger.LogException("reading mod.io metadata JSON", jsonTask.Exception);
+                modCallback?.Invoke(ModCallbackInfo.FailedCallback);
+                yield break;
+            }
+
+            try
+            {
+                var jObject = JObject.Parse(jsonTask.Result);
+
+                var modData = new ModData(jObject);
+                var modCallbackInfo = new ModCallbackInfo()
+                {
+                    Data = modData,
+                    Result = ModResult.SUCCEEDED,
+                };
+
+                modCallback?.Invoke(modCallbackInfo);
+            }
+            catch (Exception e)
+            {
+                FusionLogger.LogException("parsing mod.io metadata JSON", e);
+                modCallback?.Invoke(ModCallbackInfo.FailedCallback);
+            }
         }
-
-        // Check for failure
-        if (!streamTask.IsCompletedSuccessfully)
-        {
-            modCallback?.Invoke(ModCallbackInfo.FailedCallback);
-
-            yield break;
-        }
-
-        Task<string> jsonTask;
-
-        // Handle any errors by running the callback as a failure
-        try
-        {
-            jsonTask = new StreamReader(streamTask.Result).ReadToEndAsync();
-        }
-        catch (Exception e)
-        {
-            FusionLogger.LogException("reading mod.io mod stream", e);
-
-            modCallback?.Invoke(ModCallbackInfo.FailedCallback);
-
-            yield break;
-        }
-
-        // Wait for completion
-        while (!jsonTask.IsCompleted)
-        {
-            yield return null;
-        }
-
-        // Check for failure
-        if (!jsonTask.IsCompletedSuccessfully)
-        {
-            modCallback?.Invoke(ModCallbackInfo.FailedCallback);
-
-            yield break;
-        }
-
-        // Convert to ModData
-        var jObject = JObject.Parse(jsonTask.Result);
-
-        var modData = new ModData(jObject);
-        var modCallbackInfo = new ModCallbackInfo()
-        {
-            Data = modData,
-            Result = ModResult.SUCCEEDED,
-        };
-
-        modCallback?.Invoke(modCallbackInfo);
     }
 
     public static string GetActivePlatform()
