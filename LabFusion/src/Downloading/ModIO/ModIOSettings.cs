@@ -14,7 +14,11 @@ public static class ModIOSettings
 {
     public const string ApiPath = "https://api.mod.io/v1/games/";
     public const int GameID = 3809; // BONELAB GameID
+    public const string ExternalTokenFileName = "FusionModIOToken.txt";
+
     public static string GameApiPath => $"{ApiPath}{GameID}/mods/";
+
+    private static readonly object _tokenLock = new();
 
     private static string _loadedToken = null;
     public static string LoadedToken => _loadedToken;
@@ -22,7 +26,10 @@ public static class ModIOSettings
     private static bool _isLoadingToken = false;
     public static bool IsLoadingToken => _isLoadingToken;
 
+    private static bool _tokenLoadCompleted = false;
+    private static bool _externalTokenChecked = false;
     private static bool _loggedMissingToken = false;
+    private static bool _loggedExternalTokenError = false;
 
     private static Action<string> _tokenLoadCallback = null;
 
@@ -38,16 +45,30 @@ public static class ModIOSettings
 
     public static void LoadToken(Action<string> loadCallback)
     {
-        if (!string.IsNullOrWhiteSpace(LoadedToken))
+        bool invokeImmediately;
+        string cachedToken;
+
+        lock (_tokenLock)
         {
-            loadCallback?.Invoke(LoadedToken);
-            return;
+            cachedToken = _loadedToken;
+            invokeImmediately = _tokenLoadCompleted;
+
+            if (!invokeImmediately)
+            {
+                _tokenLoadCallback += loadCallback;
+
+                if (_isLoadingToken)
+                {
+                    return;
+                }
+
+                _isLoadingToken = true;
+            }
         }
 
-        _tokenLoadCallback += loadCallback;
-
-        if (IsLoadingToken)
+        if (invokeImmediately)
         {
+            InvokeTokenCallback(loadCallback, cachedToken);
             return;
         }
 
@@ -56,29 +77,82 @@ public static class ModIOSettings
 
     private static IEnumerator CoLoadToken()
     {
-        // Start loading
-        _isLoadingToken = true;
+        // Prefer the explicit Fusion token file. This replaces the old external
+        // FusionTokenBridge patch while preserving Fusion's normal settings fallback.
+        if (!_externalTokenChecked)
+        {
+            _externalTokenChecked = true;
 
+            var externalPath = Path.Combine(MelonEnvironment.UserDataDirectory, ExternalTokenFileName);
+
+            if (File.Exists(externalPath))
+            {
+                Task<string> externalReadTask;
+
+                try
+                {
+                    externalReadTask = File.ReadAllTextAsync(externalPath);
+                }
+                catch (Exception e)
+                {
+                    LogExternalTokenError("Could not open UserData/FusionModIOToken.txt.", e);
+                    externalReadTask = null;
+                }
+
+                if (externalReadTask != null)
+                {
+                    while (!externalReadTask.IsCompleted)
+                    {
+                        yield return null;
+                    }
+
+                    if (externalReadTask.IsCompletedSuccessfully)
+                    {
+                        var token = externalReadTask.Result?.Trim();
+
+                        if (!string.IsNullOrWhiteSpace(token))
+                        {
+                            EndLoadToken(token);
+                            yield break;
+                        }
+
+                        LogExternalTokenError("UserData/FusionModIOToken.txt is empty.");
+                    }
+                    else
+                    {
+                        LogExternalTokenError("Could not read UserData/FusionModIOToken.txt.", externalReadTask.Exception);
+                    }
+                }
+            }
+            else
+            {
+                LogExternalTokenError("UserData/FusionModIOToken.txt was not found; falling back to Fusion's normal mod.io settings.");
+            }
+        }
+
+        // Preserve Fusion's native mod.io configuration as a fallback.
         var settingsPath = ModDownloader.ModSettingsPath;
 
         if (!File.Exists(settingsPath))
         {
-            if (!_loggedMissingToken)
-            {
-                FusionLogger.Error("mod.io token is missing! Please set it in the mods menu!");
-                _loggedMissingToken = true;
-            }
-
+            LogMissingToken();
             EndLoadToken(null);
-
             yield break;
         }
 
-        using var stream = new FileStream(settingsPath, FileMode.Open);
+        Task<string> settingsTask;
 
-        var reader = new StreamReader(stream);
-
-        var settingsTask = reader.ReadToEndAsync();
+        try
+        {
+            settingsTask = File.ReadAllTextAsync(settingsPath);
+        }
+        catch (Exception e)
+        {
+            FusionLogger.LogException("opening mod.io settings", e);
+            LogMissingToken();
+            EndLoadToken(null);
+            yield break;
+        }
 
         while (!settingsTask.IsCompleted)
         {
@@ -88,35 +162,103 @@ public static class ModIOSettings
         if (!settingsTask.IsCompletedSuccessfully)
         {
             FusionLogger.Error("Failed reading mod.io token from settings!");
-
+            LogMissingToken();
             EndLoadToken(null);
-
             yield break;
         }
 
-        JObject settingsJson = JObject.Parse(settingsTask.Result);
+        try
+        {
+            var settingsJson = JObject.Parse(settingsTask.Result);
+            var token = settingsJson["mod.io.access_token"]?.ToString()?.Trim();
 
-        var token = settingsJson["mod.io.access_token"].ToString();
+            if (string.IsNullOrWhiteSpace(token))
+            {
+                LogMissingToken();
+                EndLoadToken(null);
+                yield break;
+            }
 
-        EndLoadToken(token);
+            EndLoadToken(token);
+        }
+        catch (Exception e)
+        {
+            FusionLogger.LogException("parsing mod.io settings", e);
+            LogMissingToken();
+            EndLoadToken(null);
+        }
     }
 
     private static void EndLoadToken(string token)
     {
-        _loadedToken = token;
+        Action<string> callbacks;
+
+        lock (_tokenLock)
+        {
+            _loadedToken = string.IsNullOrWhiteSpace(token) ? null : token.Trim();
+            _tokenLoadCompleted = true;
+            _isLoadingToken = false;
+
+            callbacks = _tokenLoadCallback;
+            _tokenLoadCallback = null;
+        }
+
+        if (callbacks == null)
+        {
+            return;
+        }
+
+        // Invoke a stable snapshot. A callback may call LoadToken again; because the
+        // load is already marked complete that call receives the cached result instead
+        // of recursively starting another coroutine.
+        foreach (var callback in callbacks.GetInvocationList().Cast<Action<string>>())
+        {
+            InvokeTokenCallback(callback, _loadedToken);
+        }
+    }
+
+    private static void InvokeTokenCallback(Action<string> callback, string token)
+    {
+        if (callback == null)
+        {
+            return;
+        }
 
         try
         {
-            _tokenLoadCallback?.Invoke(token);
-            _tokenLoadCallback = null;
+            callback(token);
         }
         catch (Exception e)
         {
             FusionLogger.LogException("invoking token load callback", e);
         }
+    }
 
-        // Make sure that this is set AFTER invoking the callback
-        // Otherwise, not sure why, a stack overflow can be caused!
-        _isLoadingToken = false;
+    private static void LogMissingToken()
+    {
+        if (_loggedMissingToken)
+        {
+            return;
+        }
+
+        FusionLogger.Error("mod.io token is missing! Add UserData/FusionModIOToken.txt or set the token in the BONELAB mods menu.");
+        _loggedMissingToken = true;
+    }
+
+    private static void LogExternalTokenError(string message, Exception exception = null)
+    {
+        if (_loggedExternalTokenError)
+        {
+            return;
+        }
+
+        FusionLogger.Error(message);
+
+        if (exception != null)
+        {
+            FusionLogger.LogException("reading Fusion mod.io token file", exception);
+        }
+
+        _loggedExternalTokenError = true;
     }
 }
