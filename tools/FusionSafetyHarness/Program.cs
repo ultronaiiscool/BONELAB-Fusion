@@ -193,6 +193,18 @@ static class ProxyInputModel
     }
 }
 
+static class HelperLaunchModel
+{
+    public static Dictionary<string, string> IsolateSteamEnvironment(Dictionary<string, string> inherited, uint appId)
+    {
+        var child = new Dictionary<string, string>(inherited, StringComparer.OrdinalIgnoreCase);
+        var value = appId.ToString();
+        child["SteamAppId"] = value;
+        child["SteamGameId"] = value;
+        return child;
+    }
+}
+
 internal static class Program
 {
     private static int Main()
@@ -323,6 +335,16 @@ internal static class Program
                 var fallback = new TokenCacheModel(() => " normal-token ");
                 var token = external.Load() ?? fallback.Load();
                 AssertEx.Equal("normal-token", token!, "fallback token");
+            }),
+            ("31 Helper launch overrides inherited game Steam IDs", () => {
+                var inherited = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["SteamAppId"] = "1592190",
+                    ["SteamGameId"] = "1592190",
+                };
+                var child = HelperLaunchModel.IsolateSteamEnvironment(inherited, 250820);
+                AssertEx.Equal("250820", child["SteamAppId"], "Helper SteamAppId");
+                AssertEx.Equal("250820", child["SteamGameId"], "Helper SteamGameId");
             }),
         };
 
