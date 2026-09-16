@@ -22,6 +22,10 @@ jobs:
         with:
           dotnet-version: 6.0.x
 
+      - name: Run lifecycle simulation harness
+        shell: pwsh
+        run: dotnet run --project .\tools\FusionSafetyHarness\FusionSafetyHarness.csproj -c Release --nologo
+
       - name: Build LabFusion
         shell: pwsh
         run: dotnet build .\LabFusion\LabFusion.csproj -c Release --nologo
@@ -32,13 +36,15 @@ jobs:
         run: |
           $dll = Get-ChildItem -Path .\LabFusion\bin\Release -Recurse -Filter LabFusion.dll | Select-Object -First 1
           if (-not $dll) { throw 'LabFusion.dll was not produced.' }
-          Get-FileHash $dll.FullName -Algorithm SHA256 | Format-List
+          Get-FileHash $dll.FullName -Algorithm SHA256 | Tee-Object -FilePath .\LabFusion.sha256 | Format-List
           Copy-Item $dll.FullName .\LabFusion.dll
 
-      - name: Upload LabFusion.dll
+      - name: Upload LabFusion.dll and hash
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: LabFusion-repair
-          path: LabFusion.dll
+          path: |
+            LabFusion.dll
+            LabFusion.sha256
           if-no-files-found: error
