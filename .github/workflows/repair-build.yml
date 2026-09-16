@@ -1,0 +1,50 @@
+name: Repair build validation
+
+on:
+  push:
+    branches:
+      - fix/steam-lifecycle-token-integration
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 6
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 6.0.x
+
+      - name: Run lifecycle simulation harness
+        shell: pwsh
+        run: dotnet run --project .\tools\FusionSafetyHarness\FusionSafetyHarness.csproj -c Release --nologo
+
+      - name: Build LabFusion
+        shell: pwsh
+        run: dotnet build .\LabFusion\LabFusion.csproj -c Release --nologo
+
+      - name: Hash LabFusion.dll
+        if: success()
+        shell: pwsh
+        run: |
+          $dll = Get-ChildItem -Path .\LabFusion\bin\Release -Recurse -Filter LabFusion.dll | Select-Object -First 1
+          if (-not $dll) { throw 'LabFusion.dll was not produced.' }
+          Get-FileHash $dll.FullName -Algorithm SHA256 | Tee-Object -FilePath .\LabFusion.sha256 | Format-List
+          Copy-Item $dll.FullName .\LabFusion.dll
+
+      - name: Upload LabFusion.dll and hash
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: LabFusion-repair
+          path: |
+            LabFusion.dll
+            LabFusion.sha256
+          if-no-files-found: error

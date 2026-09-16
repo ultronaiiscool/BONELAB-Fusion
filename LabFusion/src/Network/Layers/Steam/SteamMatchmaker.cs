@@ -12,73 +12,159 @@ namespace LabFusion.Network;
 
 public sealed class SteamMatchmaker : IMatchmaker
 {
+    private const double BrowseTimeoutSeconds = 15d;
+
     private delegate Task<Lobby[]> LobbySearchDelegate(MatchmakerFilters filters);
+
+    private readonly SteamNetworkLayer _owner;
+    private readonly int _layerGeneration;
+
+    private int _requestEpoch;
+    private int _latestRequestId;
+
+    public SteamMatchmaker(SteamNetworkLayer owner, int layerGeneration)
+    {
+        _owner = owner ?? throw new ArgumentNullException(nameof(owner));
+        _layerGeneration = layerGeneration;
+    }
+
+    public void CancelAll(string reason)
+    {
+        Interlocked.Increment(ref _requestEpoch);
+        Interlocked.Increment(ref _latestRequestId);
+        FusionLogger.Log($"Steam Browse requests cancelled for generation {_layerGeneration}: {reason}.");
+    }
 
     public void RequestLobbies(Action<IMatchmaker.MatchmakerCallbackInfo> callback) => RequestLobbies(MatchmakerFilters.Empty, callback);
 
     public void RequestLobbies(MatchmakerFilters filters, Action<IMatchmaker.MatchmakerCallbackInfo> callback)
     {
-        MelonCoroutines.Start(FindLobbies(FetchLobbies, filters, callback));
+        StartRequest(FetchLobbies, filters, callback);
     }
 
     public void RequestLobbiesByCode(string code, Action<IMatchmaker.MatchmakerCallbackInfo> callback)
     {
-        MelonCoroutines.Start(FindLobbies(FetchLobbies, MatchmakerFilters.Empty, callback));
+        if (string.IsNullOrWhiteSpace(code))
+        {
+            callback?.Invoke(IMatchmaker.MatchmakerCallbackInfo.Empty);
+            return;
+        }
 
-        Task<Lobby[]> FetchLobbies(MatchmakerFilters filters) => FetchLobbiesByCode(code);
+        StartRequest((_) => FetchLobbiesByCode(code), MatchmakerFilters.Empty, callback);
     }
 
-    private static IEnumerator FindLobbies(LobbySearchDelegate searchDelegate, MatchmakerFilters filters, Action<IMatchmaker.MatchmakerCallbackInfo> callback)
+    private void StartRequest(LobbySearchDelegate searchDelegate, MatchmakerFilters filters, Action<IMatchmaker.MatchmakerCallbackInfo> callback)
     {
-        // Fetch lobbies
-        var task = searchDelegate(filters);
+        var requestId = Interlocked.Increment(ref _latestRequestId);
+        var epoch = Volatile.Read(ref _requestEpoch);
 
-        // Wait for the lobby search to complete
+        FusionLogger.Log($"Steam Browse started: generation {_layerGeneration}, request {requestId}.");
+        MelonCoroutines.Start(FindLobbies(searchDelegate, filters, callback, requestId, epoch));
+    }
+
+    private IEnumerator FindLobbies(LobbySearchDelegate searchDelegate, MatchmakerFilters filters, Action<IMatchmaker.MatchmakerCallbackInfo> callback, int requestId, int epoch)
+    {
+        bool completed = false;
+        Task<Lobby[]> task;
+
+        if (!CanUseRequest(requestId, epoch))
+        {
+            yield break;
+        }
+
+        try
+        {
+            task = searchDelegate(filters);
+        }
+        catch (Exception e)
+        {
+            FusionLogger.LogException("starting Steam lobby search", e);
+            Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref completed, requestId, "start failure");
+            yield break;
+        }
+
+        var started = DateTime.UtcNow;
+
         while (!task.IsCompleted)
         {
+            if (!CanUseRequest(requestId, epoch))
+            {
+                FusionLogger.Log($"Steam Browse cancelled/stale: generation {_layerGeneration}, request {requestId}.");
+                MelonCoroutines.Start(RetainTaskUntilNativeCompletion(task, requestId));
+                yield break;
+            }
+
+            if ((DateTime.UtcNow - started).TotalSeconds >= BrowseTimeoutSeconds)
+            {
+                FusionLogger.Warn($"Steam Browse timed out: generation {_layerGeneration}, request {requestId}.");
+                Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref completed, requestId, "timeout");
+
+                // Facepunch's LobbyQuery does not expose supported cancellation. Keep
+                // the Task rooted until Steam finishes it; the Steam client itself is
+                // intentionally retained for process lifetime by SteamNetworkLayer.
+                MelonCoroutines.Start(RetainTaskUntilNativeCompletion(task, requestId));
+                yield break;
+            }
+
             yield return null;
         }
 
-        // If the lobby search errored, return an empty list and log the reason why
+        if (!CanUseRequest(requestId, epoch))
+        {
+            FusionLogger.Log($"Steam Browse late completion ignored: generation {_layerGeneration}, request {requestId}.");
+            yield break;
+        }
+
         if (!task.IsCompletedSuccessfully)
         {
-            FusionLogger.LogException("searching for lobbies", task.Exception);
-            callback?.Invoke(IMatchmaker.MatchmakerCallbackInfo.Empty);
+            FusionLogger.LogException("searching for Steam lobbies", task.Exception);
+            Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref completed, requestId, "failure");
             yield break;
         }
 
         var lobbies = task.Result;
-
-        // Steam can return null if none are available
-        if (lobbies == null)
+        if (lobbies == null || lobbies.Length == 0)
         {
-            callback?.Invoke(IMatchmaker.MatchmakerCallbackInfo.Empty);
+            Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref completed, requestId, "zero lobbies");
             yield break;
         }
 
-        List<IMatchmaker.LobbyInfo> netLobbies = new();
+        List<IMatchmaker.LobbyInfo> netLobbies = new(lobbies.Length);
 
         foreach (var lobby in lobbies)
         {
-            // Make sure this is not us
-            if (lobby.Owner.IsMe)
+            if (!CanUseRequest(requestId, epoch))
             {
-                continue;
+                FusionLogger.Log($"Steam Browse metadata processing cancelled: generation {_layerGeneration}, request {requestId}.");
+                yield break;
             }
 
-            var networkLobby = new SteamLobby(lobby);
-            var metadata = LobbyMetadataSerializer.ReadInfo(networkLobby);
-
-            if (!metadata.HasLobbyOpen)
+            try
             {
-                continue;
+                if (lobby.Owner.IsMe)
+                {
+                    continue;
+                }
+
+                var networkLobby = new SteamLobby(lobby);
+                var metadata = LobbyMetadataSerializer.ReadInfo(networkLobby);
+
+                if (!metadata.HasLobbyOpen)
+                {
+                    continue;
+                }
+
+                netLobbies.Add(new IMatchmaker.LobbyInfo()
+                {
+                    Lobby = networkLobby,
+                    Metadata = metadata,
+                });
             }
-
-            netLobbies.Add(new IMatchmaker.LobbyInfo()
+            catch (Exception e)
             {
-                Lobby = networkLobby,
-                Metadata = metadata,
-            });
+                // A malformed lobby should not fail the whole Browse operation.
+                FusionLogger.LogException("validating Steam lobby metadata", e);
+            }
         }
 
         var info = new IMatchmaker.MatchmakerCallbackInfo()
@@ -86,7 +172,53 @@ public sealed class SteamMatchmaker : IMatchmaker
             Lobbies = netLobbies.ToArray(),
         };
 
-        callback?.Invoke(info);
+        Complete(callback, info, ref completed, requestId, "success");
+    }
+
+    private IEnumerator RetainTaskUntilNativeCompletion(Task<Lobby[]> task, int requestId)
+    {
+        while (!task.IsCompleted)
+        {
+            yield return null;
+        }
+
+        // Observe faults so an abandoned native request does not become an
+        // unobserved Task exception. Never call the old UI callback from here.
+        if (task.IsFaulted && task.Exception != null)
+        {
+            FusionLogger.LogException($"late Steam Browse request {requestId}", task.Exception);
+        }
+    }
+
+    private bool CanUseRequest(int requestId, int epoch)
+    {
+        return SteamClient.IsValid
+            && _owner.IsGenerationCurrent(_layerGeneration)
+            && requestId == Volatile.Read(ref _latestRequestId)
+            && epoch == Volatile.Read(ref _requestEpoch);
+    }
+
+    private static void Complete(Action<IMatchmaker.MatchmakerCallbackInfo> callback, IMatchmaker.MatchmakerCallbackInfo info, ref bool completed, int requestId, string reason)
+    {
+        if (completed)
+        {
+            FusionLogger.Warn($"Steam Browse duplicate completion suppressed for request {requestId}.");
+            return;
+        }
+
+        completed = true;
+        FusionLogger.Log($"Steam Browse completed: request {requestId}, reason {reason}.");
+
+        try
+        {
+            // This method is only called by a Melon coroutine, so menu/UI completion
+            // stays on Unity's main thread rather than a native/Task callback thread.
+            callback?.Invoke(info);
+        }
+        catch (Exception e)
+        {
+            FusionLogger.LogException("completing Steam Browse UI callback", e);
+        }
     }
 
     private static Task<Lobby[]> FetchLobbies(MatchmakerFilters filters)
@@ -107,7 +239,7 @@ public sealed class SteamMatchmaker : IMatchmaker
         query = AddPersistentFilters(query);
 
         return query
-            .WithKeyValue(LobbyKeys.LobbyCodeKey, code.ToUpper())
+            .WithKeyValue(LobbyKeys.LobbyCodeKey, code.ToUpperInvariant())
             .RequestAsync();
     }
 
@@ -130,12 +262,9 @@ public sealed class SteamMatchmaker : IMatchmaker
         if (filters.FilterMismatchingVersions)
         {
             var version = FusionMod.Version;
-            var versionMajor = version.Major;
-            var versionMinor = version.Minor;
-
             query = query
-                .WithEqual(LobbyKeys.VersionMajorKey, versionMajor)
-                .WithEqual(LobbyKeys.VersionMinorKey, versionMinor);
+                .WithEqual(LobbyKeys.VersionMajorKey, version.Major)
+                .WithEqual(LobbyKeys.VersionMinorKey, version.Minor);
         }
 
         return query;
