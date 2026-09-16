@@ -4,7 +4,7 @@ This fork remains based on upstream BONELAB Fusion 1.14.2. It preserves Fusion's
 
 ## Steam and Login behavior
 
-BONELAB's process-owned Steam client is never shut down or reinitialized as SteamVR App ID `250820`. On desktop, Fusion uses the out-of-process Fusion Helper whenever BONELAB already owns Steam. Fusion can launch an installed Helper from the `BONELAB/Fusion Helper` folder, waits at most 20 seconds for discovery and Steam initialization, rejects overlapping login attempts, and invalidates callbacks from older attempts. Logout can cancel an in-progress login and is safe to repeat.
+BONELAB's process-owned Steam client is never shut down or reinitialized as SteamVR App ID `250820`. On desktop, Fusion uses the out-of-process Fusion Helper whenever BONELAB already owns Steam. Fusion can launch an installed Helper from the `BONELAB/Fusion Helper` folder, pins the child process to SteamVR App ID `250820` instead of inheriting a conflicting game/emulator Steam ID, waits at most 20 seconds for discovery and Steam initialization, rejects overlapping login attempts, and invalidates callbacks from older attempts. Logout can cancel an in-progress login and is safe to repeat.
 
 Install the official [Fusion Helper v1.2.0](https://github.com/Lakatrazz/Fusion-Helper/releases/tag/v1.2.0) when the desktop SteamVR layer is used. The Helper keeps the SteamVR context outside BONELAB's process; no second Steam runtime is embedded in `LabFusion.dll`.
 
@@ -41,4 +41,4 @@ Exit BONELAB, remove the new DLL, restore the backed-up `LabFusion.dll`, and res
 
 ## Validation boundary
 
-The source builds against a real BONELAB/MelonLoader IL2CPP reference set, and the 30-scenario lifecycle/token simulation harness passes. Native Steam behavior still requires the real-game validation procedure above; a managed build and simulation cannot prove that every native driver/runtime combination is crash-free.
+The source builds against a real BONELAB/MelonLoader IL2CPP reference set, and the 31-scenario lifecycle/token simulation harness passes. Native Steam behavior still requires the real-game validation procedure above; a managed build and simulation cannot prove that every native driver/runtime combination is crash-free.

@@ -180,7 +180,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
         return 28340;
     }
 
-    private static bool TryStartLocalFusionHelper(int port)
+    private static bool TryStartLocalFusionHelper(int port, uint applicationId)
     {
         if (PlatformHelper.IsAndroid)
         {
@@ -225,14 +225,26 @@ public abstract class ProxyNetworkLayer : NetworkLayer
                 if (!string.IsNullOrWhiteSpace(workingDirectory))
                 {
                     File.WriteAllText(Path.Combine(workingDirectory, "port.txt"), port.ToString());
+                    File.WriteAllText(Path.Combine(workingDirectory, "steam_appid.txt"), applicationId.ToString());
                 }
 
-                Process.Start(new ProcessStartInfo()
+                var startInfo = new ProcessStartInfo()
                 {
                     FileName = candidate,
                     WorkingDirectory = workingDirectory,
-                    UseShellExecute = true,
-                });
+                    UseShellExecute = false,
+                };
+
+                // Steam-emulated/non-Steam BONELAB builds can set process-level Steam
+                // IDs for 1592190. A child process inherits those values, and they take
+                // precedence over the Helper's steam_appid.txt, causing SteamAPI_Init to
+                // fail even though the Helper was explicitly asked to use SteamVR.
+                // Keep the out-of-process Steam owner pinned to Fusion's requested ID.
+                var helperAppId = applicationId.ToString();
+                startInfo.Environment["SteamAppId"] = helperAppId;
+                startInfo.Environment["SteamGameId"] = helperAppId;
+
+                Process.Start(startInfo);
 
                 FusionLogger.Log($"Started local Fusion Helper on proxy port {port} for isolated SteamVR networking.");
                 return true;
@@ -455,7 +467,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
         // Require it up front instead of silently waiting forever for a process that
         // is not installed. Android/Quest still discovers the Helper over the LAN.
         var proxyPort = GetProxyPort();
-        if (!PlatformHelper.IsAndroid && !TryStartLocalFusionHelper(proxyPort))
+        if (!PlatformHelper.IsAndroid && !TryStartLocalFusionHelper(proxyPort, ApplicationID))
         {
             FailProxyLogin(generation, "Fusion Helper is required for crash-safe SteamVR networking on PC. Extract the bundled 'Fusion Helper' folder into the BONELAB folder, then press Log In again.");
             return;
