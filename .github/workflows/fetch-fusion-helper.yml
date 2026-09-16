@@ -1,0 +1,36 @@
+name: Fetch Fusion Helper
+
+on:
+  push:
+    branches:
+      - temp/helper-fetch
+    paths:
+      - .github/workflows/fetch-fusion-helper.yml
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download official Windows helper
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -fL --retry 3 -o FusionHelper_Windows.zip \
+            https://github.com/Lakatrazz/Fusion-Helper/releases/download/v1.2.0/FusionHelper_Windows.zip
+          mkdir helper
+          unzip -q FusionHelper_Windows.zip -d helper
+          find helper -maxdepth 3 -type f -printf '%P\n' | sort | tee helper-layout.txt
+          sha256sum FusionHelper_Windows.zip | tee helper-zip-sha256.txt
+      - name: Upload helper package
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusion-helper-windows-official
+          path: |
+            FusionHelper_Windows.zip
+            helper-layout.txt
+            helper-zip-sha256.txt
+          compression-level: 0
+          retention-days: 1
