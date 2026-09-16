@@ -2,7 +2,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$BonelabDir,
 
-    [string]$Tag = "v1.14.2-steam-token-repair.1",
+    [string]$Tag = "v1.14.2-fork.2",
 
     [switch]$Publish
 )
@@ -68,7 +68,7 @@ try {
         if ($LASTEXITCODE -ne 0) { throw "GitHub CLI is not authenticated." }
 
         $notes = @"
-Fusion 1.14.2 Steam/Token Repair
+Fusion 1.14.2 Fork - Steam Lifecycle, Token, Stability and Latency Repair
 
 Based on upstream BONELAB Fusion v1.14.2.
 
@@ -76,21 +76,27 @@ Changes:
 - Integrates FusionModIOToken.txt token loading directly into Fusion; FusionTokenBridge.dll is no longer required.
 - Avoids shutting down BONELAB's Steamworks client and reinitializing the game process under SteamVR App ID 250820.
 - Uses Fusion's existing isolated proxy/Fusion Helper path when BONELAB owns the Steam client.
-- Adds bounded, generation-aware Browse completion and stale-callback protection.
-- Hardens proxy matchmaking request ownership and timeout behavior.
+- Makes Login/Logout generation-aware, idempotent, cancellable, and terminal on Helper failure or timeout.
+- Adds bounded, exactly-once Browse completion, stale-callback protection, and one-native-request gating.
+- Requests proxy lobby metadata concurrently under one global timeout to reduce Browse latency.
+- Validates Helper packet lengths/counts and rate-limits malformed-packet diagnostics.
+- Keeps public Fusion APIs and packet formats intact for existing mods.
 
 Installation:
-1. Back up your existing Mods\LabFusion.dll.
-2. Remove FusionTokenBridge.dll from Mods if installed.
-3. Replace LabFusion.dll with the attached file.
-4. Keep BoneLib and normal Fusion requirements installed.
-5. For the isolated SteamVR route, run the compatible Fusion Helper when prompted/required.
+1. Exit BONELAB.
+2. Back up your existing Mods\LabFusion.dll.
+3. Remove FusionTokenBridge.dll from Mods if installed.
+4. Replace LabFusion.dll with the attached file.
+5. Keep BoneLib and normal Fusion requirements installed.
+6. Optionally place a token in BONELAB\UserData\FusionModIOToken.txt.
+7. Install Fusion Helper v1.2.0 in BONELAB\Fusion Helper for the isolated desktop SteamVR route.
+8. Launch BONELAB, press Log In, open Browse repeatedly, join, disconnect/reconnect, change scenes, and Browse again.
 
 Rollback:
-Restore the backed-up LabFusion.dll and remove this repair build.
+Exit BONELAB, remove the new DLL, restore the backed-up LabFusion.dll, and restore the previous Helper/network-layer configuration if it was changed.
 
 Validation status:
-The automated lifecycle/token simulation harness passes. Compilation was performed against the BONELAB installation supplied to this script. BONELAB runtime validation is still required; compilation alone does not prove the native Steam crash is fixed.
+The automated lifecycle/token simulation harness passes. Compilation was performed against the BONELAB installation supplied to this script. Native Steam stability must still be validated in a real BONELAB process; compilation and simulation cannot prove that steam_api64.dll will never fault.
 
 SHA-256:
 $hashLine
@@ -105,8 +111,8 @@ $hashLine
             $stagedDll `
             (Join-Path $stage "SHA256SUMS.txt") `
             --repo "ultronaiiscool/BONELAB-Fusion" `
-            --target "fix/steam-lifecycle-token-integration" `
-            --title "Fusion 1.14.2 Steam/Token Repair" `
+            --target "main" `
+            --title "Fusion 1.14.2 Fork - Steam Lifecycle, Token, Stability and Latency Repair" `
             --notes $notes
 
         if ($LASTEXITCODE -ne 0) { throw "GitHub release creation failed." }
