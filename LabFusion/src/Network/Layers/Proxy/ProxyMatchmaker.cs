@@ -77,7 +77,7 @@ public sealed class ProxyMatchmaker : IMatchmaker
     private IEnumerator FindLobbies(ProxyLobbyRequestParameters parameters, Action<IMatchmaker.MatchmakerCallbackInfo> callback, int requestId)
     {
         bool completed = false;
-        Task<List<ulong>> task;
+        Task<ulong[]> task;
 
         try
         {
