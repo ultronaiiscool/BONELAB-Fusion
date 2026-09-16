@@ -372,7 +372,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
             serverConnection = null;
         }
 
-        EventBasedNetFistener listener = new();
+        EventBasedNetListener listener = new();
         client = new NetManager(listener)
         {
             UnconnectedMessagesEnabled = true,
