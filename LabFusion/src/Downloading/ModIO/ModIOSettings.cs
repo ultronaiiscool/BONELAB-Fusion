@@ -3,6 +3,7 @@
 using LabFusion.Utilities;
 
 using MelonLoader;
+using MelonLoader.Utils;
 
 using Newtonsoft.Json.Linq;
 
