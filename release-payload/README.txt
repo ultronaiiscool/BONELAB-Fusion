@@ -1,0 +1,1 @@
+Temporary release-payload branch for v1.14.2-steam-token-repair.1. Payload is reconstructed and checksum-verified by GitHub Actions, then this branch can be reset to the clean repair commit.
