@@ -1,4 +1,4 @@
-﻿using Il2CppSLZ.Marrow.Forklift;
+using Il2CppSLZ.Marrow.Forklift;
 
 using LabFusion.Utilities;
 
@@ -18,6 +18,7 @@ public static class ModIOSettings
     public const string ExternalTokenFileName = "FusionModIOToken.txt";
 
     public static string GameApiPath => $"{ApiPath}{GameID}/mods/";
+    public static string ExternalTokenPath => Path.Combine(MelonEnvironment.UserDataDirectory, ExternalTokenFileName);
 
     private static readonly object _tokenLock = new();
 
@@ -84,7 +85,7 @@ public static class ModIOSettings
         {
             _externalTokenChecked = true;
 
-            var externalPath = Path.Combine(MelonEnvironment.UserDataDirectory, ExternalTokenFileName);
+            var externalPath = ExternalTokenPath;
 
             if (File.Exists(externalPath))
             {
@@ -113,6 +114,7 @@ public static class ModIOSettings
 
                         if (!string.IsNullOrWhiteSpace(token))
                         {
+                            FusionLogger.Log("Loaded mod.io token from UserData/FusionModIOToken.txt.");
                             EndLoadToken(token);
                             yield break;
                         }

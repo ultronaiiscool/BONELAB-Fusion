@@ -1,4 +1,5 @@
-﻿using System.Collections;
+using System.Collections;
+using System.Diagnostics;
 
 using LabFusion.Player;
 using LabFusion.Utilities;
@@ -8,6 +9,7 @@ using LabFusion.Voice.Unity;
 using LabFusion.UI.Popups;
 
 using MelonLoader;
+using MelonLoader.Utils;
 
 using LabFusion.Senders;
 
@@ -53,6 +55,11 @@ public abstract class ProxyNetworkLayer : NetworkLayer
     private NetPeer serverConnection;
     private ProxyLobbyManager _lobbyManager;
 
+    private const float ProxyLoginTimeoutSeconds = 20f;
+    private const float ProxyDiscoveryIntervalSeconds = 1f;
+    private bool _loginInProgress;
+    private int _loginGeneration;
+
     public override bool CheckSupported()
     {
         return PlatformHelper.IsAndroid;
@@ -77,37 +84,140 @@ public abstract class ProxyNetworkLayer : NetworkLayer
         _matchmaker = new ProxyMatchmaker(_lobbyManager);
     }
 
-    public IEnumerator DiscoverServer()
+    public IEnumerator DiscoverServer(int generation)
     {
         int port = ClientSettings.ProxyPort.Value;
 
         if (!(port >= 1024 && port <= 65535))
         {
-            FusionLogger.Error("Custom port is invalid, using default! (28430)");
+            FusionLogger.Error("Custom port is invalid, using default! (28340)");
             port = 28340;
         }
 
-        float timeElapsed;
+        float elapsed = 0f;
+        float sinceBroadcast = ProxyDiscoveryIntervalSeconds;
 
         NetDataWriter writer = new();
         writer.Put("FUSION_SERVER_DISCOVERY");
 
-        while (serverConnection == null)
+        while (generation == _loginGeneration && _loginInProgress && serverConnection == null)
         {
-            timeElapsed = 0;
-            client.SendBroadcast(writer, port);
-
-            // Wait every 5 seconds to try again incase it failed
-            while (timeElapsed < 5f)
+            var currentClient = client;
+            if (currentClient == null)
             {
-                // Poll events while discovering
-                client.PollEvents();
+                yield break;
+            }
 
-                // Tick time
-                timeElapsed += TimeReferences.DeltaTime;
-                yield return null;
+            currentClient.PollEvents();
+
+            if (sinceBroadcast >= ProxyDiscoveryIntervalSeconds)
+            {
+                currentClient.SendBroadcast(writer, port);
+                sinceBroadcast = 0f;
+            }
+
+            if (elapsed >= ProxyLoginTimeoutSeconds)
+            {
+                FailProxyLogin(generation, "Fusion Helper was not found. Start Fusion Helper, or place it in BONELAB/Fusion Helper, then press Log In again.");
+                yield break;
+            }
+
+            elapsed += TimeReferences.DeltaTime;
+            sinceBroadcast += TimeReferences.DeltaTime;
+            yield return null;
+        }
+    }
+
+    private void FailProxyLogin(int generation, string message)
+    {
+        if (generation != _loginGeneration || !_loginInProgress)
+        {
+            return;
+        }
+
+        _loginInProgress = false;
+
+        try
+        {
+            client?.Stop();
+        }
+        catch (Exception e)
+        {
+            FusionLogger.LogException("stopping proxy client after login failure", e);
+        }
+
+        client = null;
+        serverConnection = null;
+
+        FusionLogger.Error(message);
+        Notifier.Send(new Notification()
+        {
+            SaveToMenu = false,
+            ShowPopup = true,
+            PopupLength = 8f,
+            Title = "Fusion Helper Required",
+            Message = message,
+            Type = NotificationType.ERROR
+        });
+    }
+
+    private static bool TryStartLocalFusionHelper()
+    {
+        if (PlatformHelper.IsAndroid)
+        {
+            return false;
+        }
+
+        try
+        {
+            if (Process.GetProcessesByName("Fusion Helper").Length > 0 || Process.GetProcessesByName("FusionHelper").Length > 0)
+            {
+                return true;
             }
         }
+        catch (Exception e)
+        {
+            FusionLogger.LogException("checking for Fusion Helper process", e);
+        }
+
+        var userData = MelonEnvironment.UserDataDirectory;
+        var gameRoot = Directory.GetParent(userData)?.FullName;
+
+        string[] candidates =
+        {
+            Path.Combine(gameRoot ?? string.Empty, "Fusion Helper", "Fusion Helper.exe"),
+            Path.Combine(gameRoot ?? string.Empty, "FusionHelper", "Fusion Helper.exe"),
+            Path.Combine(gameRoot ?? string.Empty, "Fusion Helper.exe"),
+            Path.Combine(userData, "Fusion Helper", "Fusion Helper.exe"),
+            Path.Combine(userData, "FusionHelper", "Fusion Helper.exe"),
+        };
+
+        foreach (var candidate in candidates)
+        {
+            if (string.IsNullOrWhiteSpace(candidate) || !File.Exists(candidate))
+            {
+                continue;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo()
+                {
+                    FileName = candidate,
+                    WorkingDirectory = Path.GetDirectoryName(candidate),
+                    UseShellExecute = true,
+                });
+
+                FusionLogger.Log("Started local Fusion Helper for isolated SteamVR networking.");
+                return true;
+            }
+            catch (Exception e)
+            {
+                FusionLogger.LogException("starting local Fusion Helper", e);
+            }
+        }
+
+        return false;
     }
 
     public void EvaluateMessage(NetPeer fromPeer, NetPacketReader dataReader, byte channel, DeliveryMethod deliveryMethod)
@@ -232,16 +342,37 @@ public abstract class ProxyNetworkLayer : NetworkLayer
 
     public override void LogIn()
     {
-        // If a client is currently running, cancel it
+        if (_loginInProgress)
+        {
+            FusionLogger.Warn("Proxy login is already in progress.");
+            return;
+        }
+
+        _loginGeneration++;
+        var generation = _loginGeneration;
+        _loginInProgress = true;
+
+        // On desktop, the crash-safe SteamVR path is the out-of-process Fusion Helper.
+        // Start a local copy automatically when the user has installed it in one of
+        // the conventional BONELAB/UserData locations.
+        TryStartLocalFusionHelper();
+
         if (client != null)
         {
-            client.Stop();
+            try
+            {
+                client.Stop();
+            }
+            catch (Exception e)
+            {
+                FusionLogger.LogException("stopping previous proxy client", e);
+            }
 
             client = null;
             serverConnection = null;
         }
 
-        EventBasedNetListener listener = new();
+        EventBasedNetFistener listener = new();
         client = new NetManager(listener)
         {
             UnconnectedMessagesEnabled = true,
@@ -253,6 +384,13 @@ public abstract class ProxyNetworkLayer : NetworkLayer
         listener.NetworkReceiveEvent += EvaluateMessage;
         listener.PeerConnectedEvent += (peer) =>
         {
+            if (generation != _loginGeneration || !_loginInProgress)
+            {
+                peer.Disconnect();
+                return;
+            }
+
+            _loginInProgress = false;
             InvokeLoggedInEvent();
 
             serverConnection = peer;
@@ -272,24 +410,43 @@ public abstract class ProxyNetworkLayer : NetworkLayer
 
         listener.NetworkReceiveUnconnectedEvent += (endPoint, reader, messageType) =>
         {
-            if (reader.TryGetString(out string data) && data == "YOU_FOUND_ME")
+            if (generation == _loginGeneration && _loginInProgress && reader.TryGetString(out string data) && data == "YOU_FOUND_ME")
             {
                 FusionLogger.Log("Found the proxy server!");
-                client.Connect(endPoint, "ProxyConnection");
+                client?.Connect(endPoint, "ProxyConnection");
             }
 
             reader.Recycle();
         };
 
-        client.Start();
-        FusionLogger.Log("Beginning proxy discovery...");
-        MelonCoroutines.Start(DiscoverServer());
+        try
+        {
+            client.Start();
+        }
+        catch (Exception e)
+        {
+            FusionLogger.LogException("starting proxy client", e);
+            FailProxyLogin(generation, "Fusion could not start the local proxy client.");
+            return;
+        }
+
+        FusionLogger.Log($"Beginning proxy discovery (generation {generation}, timeout {ProxyLoginTimeoutSeconds:0}s)...");
+        MelonCoroutines.Start(DiscoverServer(generation));
     }
 
     public override void LogOut()
     {
-        // End the running client
-        client.Stop();
+        _loginGeneration++;
+        _loginInProgress = false;
+
+        try
+        {
+            client?.Stop();
+        }
+        catch (Exception e)
+        {
+            FusionLogger.LogException("stopping proxy client during logout", e);
+        }
 
         client = null;
         serverConnection = null;
@@ -299,7 +456,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
 
     public override void OnUpdateLayer()
     {
-        client.PollEvents();
+        client?.PollEvents();
     }
 
     internal static NetDataWriter NewWriter(MessageTypes type)
