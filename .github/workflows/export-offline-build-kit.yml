@@ -1,0 +1,58 @@
+name: Export Offline Build Kit
+
+on:
+  push:
+    branches:
+      - fix/steam-lifecycle-token-integration
+    paths:
+      - .github/workflows/export-offline-build-kit.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact branch commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install isolated .NET 6 SDK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p "$RUNNER_TEMP/offline-dotnet"
+          curl -fsSL https://dot.net/v1/dotnet-install.sh -o "$RUNNER_TEMP/dotnet-install.sh"
+          bash "$RUNNER_TEMP/dotnet-install.sh" --version 6.0.428 --install-dir "$RUNNER_TEMP/offline-dotnet"
+          "$RUNNER_TEMP/offline-dotnet/dotnet" --info
+
+      - name: Restore Fusion NuGet packages
+        shell: bash
+        run: |
+          set -euxo pipefail
+          export PATH="$RUNNER_TEMP/offline-dotnet:$PATH"
+          dotnet restore LabFusion/LabFusion.csproj
+
+      - name: Package source, SDK, and NuGet cache
+        shell: bash
+        run: |
+          set -euxo pipefail
+          rm -rf "$RUNNER_TEMP/offline-kit"
+          mkdir -p "$RUNNER_TEMP/offline-kit/source" "$RUNNER_TEMP/offline-kit/dotnet" "$RUNNER_TEMP/offline-kit/nuget-packages"
+          rsync -a --exclude='.git' ./ "$RUNNER_TEMP/offline-kit/source/"
+          rsync -a "$RUNNER_TEMP/offline-dotnet/" "$RUNNER_TEMP/offline-kit/dotnet/"
+          rsync -a "$HOME/.nuget/packages/" "$RUNNER_TEMP/offline-kit/nuget-packages/"
+          printf '%s\n' "${GITHUB_SHA}" > "$RUNNER_TEMP/offline-kit/COMMIT_SHA.txt"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/fusion-offline-build-kit.tar.gz" offline-kit
+          ls -lh "$RUNNER_TEMP/fusion-offline-build-kit.tar.gz"
+
+      - name: Upload offline build kit
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusion-offline-build-kit
+          path: ${{ runner.temp }}/fusion-offline-build-kit.tar.gz
+          compression-level: 0
+          retention-days: 1
