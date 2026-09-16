@@ -86,13 +86,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
 
     public IEnumerator DiscoverServer(int generation)
     {
-        int port = ClientSettings.ProxyPort.Value;
-
-        if (!(port >= 1024 && port <= 65535))
-        {
-            FusionLogger.Error("Custom port is invalid, using default! (28340)");
-            port = 28340;
-        }
+        int port = GetProxyPort();
 
         float elapsed = 0f;
         float sinceBroadcast = ProxyDiscoveryIntervalSeconds;
@@ -100,7 +94,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
         NetDataWriter writer = new();
         writer.Put("FUSION_SERVER_DISCOVERY");
 
-        while (generation == _loginGeneration && _loginInProgress && serverConnection == null)
+        while (generation == _loginGeneration && _loginInProgress)
         {
             var currentClient = client;
             if (currentClient == null)
@@ -110,7 +104,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
 
             currentClient.PollEvents();
 
-            if (sinceBroadcast >= ProxyDiscoveryIntervalSeconds)
+            if (serverConnection == null && sinceBroadcast >= ProxyDiscoveryIntervalSeconds)
             {
                 currentClient.SendBroadcast(writer, port);
                 sinceBroadcast = 0f;
@@ -161,7 +155,19 @@ public abstract class ProxyNetworkLayer : NetworkLayer
         });
     }
 
-    private static bool TryStartLocalFusionHelper()
+    private static int GetProxyPort()
+    {
+        var port = ClientSettings.ProxyPort.Value;
+        if (port >= 1024 && port <= 65535)
+        {
+            return port;
+        }
+
+        FusionLogger.Error("Custom proxy port is invalid, using default 28340.");
+        return 28340;
+    }
+
+    private static bool TryStartLocalFusionHelper(int port)
     {
         if (PlatformHelper.IsAndroid)
         {
@@ -172,6 +178,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
         {
             if (Process.GetProcessesByName("Fusion Helper").Length > 0 || Process.GetProcessesByName("FusionHelper").Length > 0)
             {
+                FusionLogger.Log("Fusion Helper is already running.");
                 return true;
             }
         }
@@ -201,14 +208,20 @@ public abstract class ProxyNetworkLayer : NetworkLayer
 
             try
             {
+                var workingDirectory = Path.GetDirectoryName(candidate);
+                if (!string.IsNullOrWhiteSpace(workingDirectory))
+                {
+                    File.WriteAllText(Path.Combine(workingDirectory, "port.txt"), port.ToString());
+                }
+
                 Process.Start(new ProcessStartInfo()
                 {
                     FileName = candidate,
-                    WorkingDirectory = Path.GetDirectoryName(candidate),
+                    WorkingDirectory = workingDirectory,
                     UseShellExecute = true,
                 });
 
-                FusionLogger.Log("Started local Fusion Helper for isolated SteamVR networking.");
+                FusionLogger.Log($"Started local Fusion Helper on proxy port {port} for isolated SteamVR networking.");
                 return true;
             }
             catch (Exception e)
@@ -244,18 +257,24 @@ public abstract class ProxyNetworkLayer : NetworkLayer
 
                     if (SteamId.Value == 0)
                     {
-                        FusionLogger.Error("Steamworks failed to initialize!");
+                        FailProxyLogin(_loginGeneration, "Fusion Helper connected, but Steamworks failed to initialize. Make sure Steam is running and SteamVR is in your library.");
                         break;
                     }
 
                     PlayerIDManager.SetLongID(SteamId.Value);
+                    _isInitialized = true;
+
+                    if (_loginInProgress)
+                    {
+                        _loginInProgress = false;
+                        InvokeLoggedInEvent();
+                    }
+
                     NetDataWriter writer = NewWriter(MessageTypes.GetUsername);
                     writer.Put(SteamId.Value);
                     SendToProxyServer(writer);
 
-                    FusionLogger.Log($"Steamworks initialized with SteamID {SteamId}!");
-
-                    _isInitialized = true;
+                    FusionLogger.Log($"Steamworks initialized through Fusion Helper with SteamID {SteamId}.");
                     break;
                 }
             case (ulong)MessageTypes.GetUsername:
@@ -353,9 +372,14 @@ public abstract class ProxyNetworkLayer : NetworkLayer
         _loginInProgress = true;
 
         // On desktop, the crash-safe SteamVR path is the out-of-process Fusion Helper.
-        // Start a local copy automatically when the user has installed it in one of
-        // the conventional BONELAB/UserData locations.
-        TryStartLocalFusionHelper();
+        // Require it up front instead of silently waiting forever for a process that
+        // is not installed. Android/Quest still discovers the Helper over the LAN.
+        var proxyPort = GetProxyPort();
+        if (!PlatformHelper.IsAndroid && !TryStartLocalFusionHelper(proxyPort))
+        {
+            FailProxyLogin(generation, "Fusion Helper is required for crash-safe SteamVR networking on PC. Extract the bundled 'Fusion Helper' folder into the BONELAB folder, then press Log In again.");
+            return;
+        }
 
         if (client != null)
         {
@@ -390,22 +414,33 @@ public abstract class ProxyNetworkLayer : NetworkLayer
                 return;
             }
 
-            _loginInProgress = false;
-            InvokeLoggedInEvent();
-
+            // A LiteNetLib connection only proves that Fusion Helper is reachable.
+            // Do not mark Fusion logged in until Helper has initialized Steam for the
+            // requested App ID and returned a valid SteamID.
             serverConnection = peer;
+
             NetDataWriter writer = NewWriter(MessageTypes.SteamID);
-
-            listener.PeerDisconnectedEvent += (peer, disconnectInfo) =>
-            {
-                FusionLogger.Error("Proxy has disconnected, logging out!");
-                serverConnection = null;
-
-                InvokeLoggedOutEvent();
-            };
-
             writer.Put(ApplicationID);
             SendToProxyServer(writer);
+        };
+
+        listener.PeerDisconnectedEvent += (peer, disconnectInfo) =>
+        {
+            if (generation != _loginGeneration)
+            {
+                return;
+            }
+
+            serverConnection = null;
+
+            if (_loginInProgress)
+            {
+                FailProxyLogin(generation, "Fusion Helper disconnected before Steam finished initializing.");
+                return;
+            }
+
+            FusionLogger.Error("Proxy has disconnected, logging out!");
+            InvokeLoggedOutEvent();
         };
 
         listener.NetworkReceiveUnconnectedEvent += (endPoint, reader, messageType) =>
