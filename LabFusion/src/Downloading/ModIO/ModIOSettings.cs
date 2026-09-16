@@ -13,11 +13,10 @@ namespace LabFusion.Downloading.ModIO;
 
 public static class ModIOSettings
 {
-    public const string ApiPath = "https://api.mod.io/v1/games/";
-    public const int GameID = 3809; // BONELAB GameID
+    public static int GameID { get; set; } = 3809; // BONELAB GameID
     public const string ExternalTokenFileName = "FusionModIOToken.txt";
 
-    public static string GameApiPath => $"{ApiPath}{GameID}/mods/";
+    public static string GameApiPath => $"https://g-{GameID}.modapi.io/v1/games/{GameID}/mods/";
     public static string ExternalTokenPath => Path.Combine(MelonEnvironment.UserDataDirectory, ExternalTokenFileName);
 
     private static readonly object _tokenLock = new();
@@ -70,11 +69,19 @@ public static class ModIOSettings
 
         if (invokeImmediately)
         {
-            InvokeTokenCallback(loadCallback, cachedToken);
+            // Preserve the original asynchronous contract. Invoking a cached callback
+            // inline allows a callback that calls LoadToken again to recurse forever.
+            MelonCoroutines.Start(CoInvokeTokenCallback(loadCallback, cachedToken));
             return;
         }
 
         MelonCoroutines.Start(CoLoadToken());
+    }
+
+    private static IEnumerator CoInvokeTokenCallback(Action<string> callback, string token)
+    {
+        yield return null;
+        InvokeTokenCallback(callback, token);
     }
 
     private static IEnumerator CoLoadToken()

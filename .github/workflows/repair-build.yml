@@ -1,16 +1,20 @@
-name: Repair build validation
+name: Fusion safety validation
 
 on:
   push:
     branches:
-      - fix/steam-lifecycle-token-integration
+      - main
+      - fix/**
+  pull_request:
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  safety:
     runs-on: windows-latest
     timeout-minutes: 20
     steps:
@@ -26,25 +30,22 @@ jobs:
         shell: pwsh
         run: dotnet run --project .\tools\FusionSafetyHarness\FusionSafetyHarness.csproj -c Release --nologo
 
-      - name: Build LabFusion
-        shell: pwsh
-        run: dotnet build .\LabFusion\LabFusion.csproj -c Release --nologo
-
-      - name: Hash LabFusion.dll
-        if: success()
+      - name: Audit forbidden in-process Steam shutdown paths
         shell: pwsh
         run: |
-          $dll = Get-ChildItem -Path .\LabFusion\bin\Release -Recurse -Filter LabFusion.dll | Select-Object -First 1
-          if (-not $dll) { throw 'LabFusion.dll was not produced.' }
-          Get-FileHash $dll.FullName -Algorithm SHA256 | Tee-Object -FilePath .\LabFusion.sha256 | Format-List
-          Copy-Item $dll.FullName .\LabFusion.dll
+          $source = (Get-ChildItem .\LabFusion\src -Recurse -Filter *.cs | ForEach-Object {
+            Get-Content -Raw -LiteralPath $_.FullName
+          }) -join "`n"
+          $forbidden = @(
+            'Il2CppSteamworks.SteamClient.Shutdown',
+            'SteamClient.Shutdown()',
+            'SteamAPI.Shutdown()'
+          )
+          foreach ($call in $forbidden) {
+            if ($source.Contains($call)) { throw "Forbidden Steam shutdown path found: $call" }
+          }
 
-      - name: Upload LabFusion.dll and hash
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: LabFusion-repair
-          path: |
-            LabFusion.dll
-            LabFusion.sha256
-          if-no-files-found: error
+      # LabFusion itself intentionally builds only against a real BONELAB/MelonLoader
+      # installation via BONELAB_DIR. Public runners do not contain or redistribute
+      # those game assemblies; release builds are produced locally with the guarded
+      # tools/BuildAndReleaseRepair.ps1 workflow.

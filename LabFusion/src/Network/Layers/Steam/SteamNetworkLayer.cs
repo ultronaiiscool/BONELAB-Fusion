@@ -55,6 +55,7 @@ public abstract class SteamNetworkLayer : NetworkLayer
     private static bool _fusionOwnsSteamClient;
     private static uint _fusionApplicationId;
     private static bool _loggedUnsafeGameSteamContext;
+    private static Task<Lobby?> _pendingLobbyCreationTask;
 
     internal int Generation => _generation;
 
@@ -409,9 +410,10 @@ public abstract class SteamNetworkLayer : NetworkLayer
             return;
         }
 
+        var generation = _generation;
         Matchmaker.RequestLobbiesByCode(code, (info) =>
         {
-            if (!IsGenerationCurrent(_generation) || info.Lobbies.Length <= 0)
+            if (!IsGenerationCurrent(generation) || info.Lobbies.Length <= 0)
             {
                 return;
             }
@@ -470,6 +472,13 @@ public abstract class SteamNetworkLayer : NetworkLayer
 
     private IEnumerator AwaitLobbyCreation(int generation)
     {
+        if (_pendingLobbyCreationTask != null && !_pendingLobbyCreationTask.IsCompleted)
+        {
+            FusionLogger.Warn("A previous Steam lobby creation is still pending; skipping a duplicate native request.");
+            yield break;
+        }
+
+        _pendingLobbyCreationTask = null;
         Task<Lobby?> task;
 
         try
@@ -482,6 +491,8 @@ public abstract class SteamNetworkLayer : NetworkLayer
             yield break;
         }
 
+        _pendingLobbyCreationTask = task;
+
         var started = DateTime.UtcNow;
 
         while (!task.IsCompleted)
@@ -489,12 +500,14 @@ public abstract class SteamNetworkLayer : NetworkLayer
             if (!IsGenerationCurrent(generation))
             {
                 FusionLogger.Log($"Ignoring local Steam lobby creation from stale generation {generation}.");
+                MelonCoroutines.Start(RetainLobbyCreationTask(task));
                 yield break;
             }
 
             if ((DateTime.UtcNow - started).TotalSeconds >= LobbyCreationTimeoutSeconds)
             {
                 FusionLogger.Warn($"Local Steam lobby creation timed out for generation {generation}; late completion will be ignored.");
+                MelonCoroutines.Start(RetainLobbyCreationTask(task));
                 yield break;
             }
 
@@ -504,8 +517,11 @@ public abstract class SteamNetworkLayer : NetworkLayer
         if (!IsGenerationCurrent(generation))
         {
             FusionLogger.Log($"Ignoring completed local Steam lobby from stale generation {generation}.");
+            _pendingLobbyCreationTask = null;
             yield break;
         }
+
+        _pendingLobbyCreationTask = null;
 
         if (!task.IsCompletedSuccessfully || !task.Result.HasValue)
         {
@@ -523,6 +539,24 @@ public abstract class SteamNetworkLayer : NetworkLayer
 
         _localLobby = task.Result.Value;
         _currentLobby = new SteamLobby(_localLobby);
+    }
+
+    private static IEnumerator RetainLobbyCreationTask(Task<Lobby?> task)
+    {
+        while (!task.IsCompleted)
+        {
+            yield return null;
+        }
+
+        if (task.IsFaulted && task.Exception != null)
+        {
+            FusionLogger.LogException("late Steam lobby creation", task.Exception);
+        }
+
+        if (ReferenceEquals(_pendingLobbyCreationTask, task))
+        {
+            _pendingLobbyCreationTask = null;
+        }
     }
 
     public void OnUpdateLobby()

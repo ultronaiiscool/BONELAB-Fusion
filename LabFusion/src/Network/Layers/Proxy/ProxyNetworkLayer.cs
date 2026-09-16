@@ -39,7 +39,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
     private IVoiceManager _voiceManager;
     public override IVoiceManager VoiceManager => _voiceManager;
 
-    private IMatchmaker _matchmaker = null;
+    private ProxyMatchmaker _matchmaker = null;
     public override IMatchmaker Matchmaker => _matchmaker;
 
     protected bool _isServerActive = false;
@@ -50,6 +50,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
     protected string _targetJoinId;
 
     protected bool _isInitialized = false;
+    private bool _isLayerInitialized = false;
 
     private NetManager client;
     private NetPeer serverConnection;
@@ -58,7 +59,9 @@ public abstract class ProxyNetworkLayer : NetworkLayer
     private const float ProxyLoginTimeoutSeconds = 20f;
     private const float ProxyDiscoveryIntervalSeconds = 1f;
     private bool _loginInProgress;
+    private bool _proxyConnectRequested;
     private int _loginGeneration;
+    private DateTime _lastMalformedMessageLogUtc = DateTime.MinValue;
 
     public override bool CheckSupported()
     {
@@ -72,6 +75,12 @@ public abstract class ProxyNetworkLayer : NetworkLayer
 
     public override void OnInitializeLayer()
     {
+        if (_isLayerInitialized)
+        {
+            return;
+        }
+
+        _isLayerInitialized = true;
         Instance = this;
 
         _voiceManager = new UnityVoiceManager();
@@ -104,7 +113,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
 
             currentClient.PollEvents();
 
-            if (serverConnection == null && sinceBroadcast >= ProxyDiscoveryIntervalSeconds)
+            if (serverConnection == null && !_proxyConnectRequested && sinceBroadcast >= ProxyDiscoveryIntervalSeconds)
             {
                 currentClient.SendBroadcast(writer, port);
                 sinceBroadcast = 0f;
@@ -130,6 +139,8 @@ public abstract class ProxyNetworkLayer : NetworkLayer
         }
 
         _loginInProgress = false;
+        _proxyConnectRequested = false;
+        _isInitialized = false;
 
         try
         {
@@ -153,6 +164,8 @@ public abstract class ProxyNetworkLayer : NetworkLayer
             Message = message,
             Type = NotificationType.ERROR
         });
+
+        InvokeLoggedOutEvent();
     }
 
     private static int GetProxyPort()
@@ -235,32 +248,53 @@ public abstract class ProxyNetworkLayer : NetworkLayer
 
     public void EvaluateMessage(NetPeer fromPeer, NetPacketReader dataReader, byte channel, DeliveryMethod deliveryMethod)
     {
-        ulong id = dataReader.GetByte();
-        switch (id)
-        {
-            case (ulong)MessageTypes.Ping:
-                {
-                    double theTime = dataReader.GetDouble();
-                    double curTime = DateTime.UtcNow.Subtract(new DateTime(1970, 1, 1)).TotalMilliseconds;
-                    FusionLogger.Log("Server -> Client = " + (curTime - theTime) + " ms.");
-                    NetDataWriter writer = NewWriter(MessageTypes.Ping);
-                    writer.Put(curTime);
-                    SendToProxyServer(writer);
-                    break;
-                }
-            case (ulong)MessageTypes.SteamID:
-                {
-                    SteamId = new SteamId()
-                    {
-                        Value = dataReader.GetULong()
-                    };
+        EvaluateMessage(_loginGeneration, fromPeer, dataReader, channel, deliveryMethod);
+    }
 
-                    if (SteamId.Value == 0)
+    private void EvaluateMessage(int generation, NetPeer fromPeer, NetPacketReader dataReader, byte channel, DeliveryMethod deliveryMethod)
+    {
+        try
+        {
+            if (generation != _loginGeneration || !ReferenceEquals(fromPeer, serverConnection))
+            {
+                return;
+            }
+
+            if (!dataReader.TryGetByte(out byte rawMessageType))
+            {
+                LogMalformedProxyMessage("missing message type");
+                return;
+            }
+
+            var messageType = (MessageTypes)rawMessageType;
+            switch (messageType)
+            {
+                case MessageTypes.Ping:
+                    if (!dataReader.TryGetDouble(out double sentAt))
                     {
-                        FailProxyLogin(_loginGeneration, "Fusion Helper connected, but Steamworks failed to initialize. Make sure Steam is running and SteamVR is in your library.");
-                        break;
+                        LogMalformedProxyMessage("invalid ping");
+                        return;
                     }
 
+                    double currentTime = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+                    NetDataWriter pingWriter = NewWriter(MessageTypes.Ping);
+                    pingWriter.Put(currentTime);
+                    SendToProxyServer(pingWriter);
+                    break;
+                case MessageTypes.SteamID:
+                    if (!dataReader.TryGetULong(out ulong steamId))
+                    {
+                        LogMalformedProxyMessage("invalid Steam ID");
+                        return;
+                    }
+
+                    if (steamId == 0)
+                    {
+                        FailProxyLogin(generation, "Fusion Helper connected, but Steamworks failed to initialize. Make sure Steam is running and SteamVR is in your library.");
+                        return;
+                    }
+
+                    SteamId = new SteamId() { Value = steamId };
                     PlayerIDManager.SetLongID(SteamId.Value);
                     _isInitialized = true;
 
@@ -270,106 +304,152 @@ public abstract class ProxyNetworkLayer : NetworkLayer
                         InvokeLoggedInEvent();
                     }
 
-                    NetDataWriter writer = NewWriter(MessageTypes.GetUsername);
-                    writer.Put(SteamId.Value);
-                    SendToProxyServer(writer);
-
+                    NetDataWriter usernameWriter = NewWriter(MessageTypes.GetUsername);
+                    usernameWriter.Put(SteamId.Value);
+                    SendToProxyServer(usernameWriter);
                     FusionLogger.Log($"Steamworks initialized through Fusion Helper with SteamID {SteamId}.");
                     break;
-                }
-            case (ulong)MessageTypes.GetUsername:
-                {
-                    string username = dataReader.GetString();
-                    LocalPlayer.Username = username;
-                }
-                break;
-            case (ulong)MessageTypes.OnDisconnected:
-                ulong longId = dataReader.GetULong();
-                if (PlayerIDManager.HasPlayerID(longId))
-                {
-                    // Update the mod so it knows this user has left
-                    InternalServerHelpers.OnPlayerLeft(longId);
-
-                    // Send disconnect notif to everyone
-                    ConnectionSender.SendDisconnect(longId);
-                }
-                break;
-            case (ulong)MessageTypes.OnMessage:
-                {
-                    byte[] data = dataReader.GetBytesWithLength();
-                    ulong platformID = dataReader.GetULong();
-
-                    ProxySocketHandler.OnSocketMessageReceived(data, true, platformID);
-                    break;
-                }
-            case (ulong)MessageTypes.OnConnectionDisconnected:
-                NetworkHelper.Disconnect();
-                break;
-            case (ulong)MessageTypes.OnConnectionMessage:
-                {
-                    byte[] data = dataReader.GetBytesWithLength();
-                    ulong platformID = dataReader.GetULong();
-
-                    ProxySocketHandler.OnSocketMessageReceived(data, false, platformID);
-                    break;
-                }
-            case (ulong)MessageTypes.JoinServer:
-                {
-                    ulong serverId = dataReader.GetULong();
-                    JoinServer(new SteamId()
+                case MessageTypes.GetUsername:
+                    if (!dataReader.TryGetString(out string username))
                     {
-                        Value = serverId
-                    });
-                }
-                break;
-            case (ulong)MessageTypes.StartServer:
-                {
+                        LogMalformedProxyMessage("invalid username");
+                        return;
+                    }
+
+                    LocalPlayer.Username = username;
+                    break;
+                case MessageTypes.OnDisconnected:
+                    if (!dataReader.TryGetULong(out ulong disconnectedId))
+                    {
+                        LogMalformedProxyMessage("invalid disconnect notification");
+                        return;
+                    }
+
+                    if (PlayerIDManager.HasPlayerID(disconnectedId))
+                    {
+                        InternalServerHelpers.OnPlayerLeft(disconnectedId);
+                        ConnectionSender.SendDisconnect(disconnectedId);
+                    }
+                    break;
+                case MessageTypes.OnMessage:
+                case MessageTypes.OnConnectionMessage:
+                    if (!dataReader.TryGetBytesWithLength(out byte[] payload) || !dataReader.TryGetULong(out ulong platformId))
+                    {
+                        LogMalformedProxyMessage("invalid network payload");
+                        return;
+                    }
+
+                    ProxySocketHandler.OnSocketMessageReceived(payload, messageType == MessageTypes.OnMessage, platformId);
+                    break;
+                case MessageTypes.OnConnectionDisconnected:
+                    NetworkHelper.Disconnect();
+                    break;
+                case MessageTypes.JoinServer:
+                    if (!dataReader.TryGetULong(out ulong serverId))
+                    {
+                        LogMalformedProxyMessage("invalid server ID");
+                        return;
+                    }
+
+                    JoinServer(new SteamId() { Value = serverId });
+                    break;
+                case MessageTypes.StartServer:
                     _isServerActive = true;
                     _isConnectionActive = true;
-
-                    // Call server setup
                     InternalServerHelpers.OnStartServer();
-
                     RefreshServerCode();
                     break;
-                }
-            case (ulong)MessageTypes.LobbyIDs:
-            case (ulong)MessageTypes.LobbyMetadata:
-                {
-                    _lobbyManager.HandleLobbyMessage((MessageTypes)id, dataReader);
+                case MessageTypes.LobbyIDs:
+                case MessageTypes.LobbyMetadata:
+                    if (_lobbyManager == null)
+                    {
+                        LogMalformedProxyMessage("lobby response arrived before layer initialization");
+                        return;
+                    }
+
+                    _lobbyManager.HandleLobbyMessage(messageType, dataReader);
                     break;
-                }
-            case (ulong)MessageTypes.SteamFriends:
-                {
-                    FriendIds = dataReader.GetULongArray().ToList();
+                case MessageTypes.SteamFriends:
+                    var friendIds = dataReader.GetULongArray();
+                    if (friendIds.Length > 4096)
+                    {
+                        LogMalformedProxyMessage("friend list exceeded the accepted limit");
+                        return;
+                    }
+
+                    FriendIds = new List<ulong>(friendIds);
                     break;
-                }
+                default:
+                    LogMalformedProxyMessage($"unknown message type {rawMessageType}");
+                    break;
+            }
+        }
+        catch (Exception e)
+        {
+            LogMalformedProxyMessage("message parsing failed", e);
+        }
+        finally
+        {
+            dataReader.Recycle();
+        }
+    }
+
+    private void LogMalformedProxyMessage(string reason, Exception exception = null)
+    {
+        var now = DateTime.UtcNow;
+        if ((now - _lastMalformedMessageLogUtc).TotalSeconds < 5d)
+        {
+            return;
         }
 
-        dataReader.Recycle();
+        _lastMalformedMessageLogUtc = now;
+        FusionLogger.Warn($"Ignored malformed Fusion Helper message: {reason}.");
+        if (exception != null)
+        {
+            FusionLogger.LogException("parsing Fusion Helper message", exception);
+        }
     }
 
     public override void OnDeinitializeLayer()
     {
+        if (!_isLayerInitialized)
+        {
+            return;
+        }
+
+        _matchmaker?.CancelAll("network layer deinitialized");
+        _lobbyManager?.CancelPending();
         Disconnect();
 
         UnHookSteamEvents();
 
-        _voiceManager.Disable();
+        _voiceManager?.Disable();
         _voiceManager = null;
+        _matchmaker = null;
+        _lobbyManager = null;
+        _currentLobby = null;
+        _isLayerInitialized = false;
+        _isInitialized = false;
+
+        StopProxyClient("network layer deinitialization");
+
+        if (ReferenceEquals(Instance, this))
+        {
+            Instance = null;
+        }
     }
 
     public override void LogIn()
     {
-        if (_loginInProgress)
+        if (_loginInProgress || _isInitialized || _isLayerInitialized)
         {
-            FusionLogger.Warn("Proxy login is already in progress.");
             return;
         }
 
         _loginGeneration++;
         var generation = _loginGeneration;
         _loginInProgress = true;
+        _proxyConnectRequested = false;
 
         // On desktop, the crash-safe SteamVR path is the out-of-process Fusion Helper.
         // Require it up front instead of silently waiting forever for a process that
@@ -405,7 +485,7 @@ public abstract class ProxyNetworkLayer : NetworkLayer
             DisconnectTimeout = 10000,
             PingInterval = 5000,
         };
-        listener.NetworkReceiveEvent += EvaluateMessage;
+        listener.NetworkReceiveEvent += (peer, reader, channel, method) => EvaluateMessage(generation, peer, reader, channel, method);
         listener.PeerConnectedEvent += (peer) =>
         {
             if (generation != _loginGeneration || !_loginInProgress)
@@ -439,16 +519,36 @@ public abstract class ProxyNetworkLayer : NetworkLayer
                 return;
             }
 
+            if (!_isInitialized && !_isLayerInitialized)
+            {
+                return;
+            }
+
+            _isInitialized = false;
             FusionLogger.Error("Proxy has disconnected, logging out!");
             InvokeLoggedOutEvent();
         };
 
         listener.NetworkReceiveUnconnectedEvent += (endPoint, reader, messageType) =>
         {
-            if (generation == _loginGeneration && _loginInProgress && reader.TryGetString(out string data) && data == "YOU_FOUND_ME")
+            if (generation == _loginGeneration
+                && _loginInProgress
+                && !_proxyConnectRequested
+                && reader.TryGetString(out string data)
+                && data == "YOU_FOUND_ME")
             {
                 FusionLogger.Log("Found the proxy server!");
-                client?.Connect(endPoint, "ProxyConnection");
+                _proxyConnectRequested = true;
+
+                try
+                {
+                    client?.Connect(endPoint, "ProxyConnection");
+                }
+                catch (Exception e)
+                {
+                    _proxyConnectRequested = false;
+                    FusionLogger.LogException("connecting to Fusion Helper", e);
+                }
             }
 
             reader.Recycle();
@@ -471,22 +571,38 @@ public abstract class ProxyNetworkLayer : NetworkLayer
 
     public override void LogOut()
     {
+        if (!_loginInProgress && !_isInitialized && !_isLayerInitialized && client == null)
+        {
+            return;
+        }
+
         _loginGeneration++;
         _loginInProgress = false;
+        _proxyConnectRequested = false;
+        _isInitialized = false;
 
+        _matchmaker?.CancelAll("logout");
+        _lobbyManager?.CancelPending();
+
+        StopProxyClient("logout");
+
+        InvokeLoggedOutEvent();
+    }
+
+    private void StopProxyClient(string reason)
+    {
         try
         {
             client?.Stop();
         }
         catch (Exception e)
         {
-            FusionLogger.LogException("stopping proxy client during logout", e);
+            FusionLogger.LogException($"stopping proxy client during {reason}", e);
         }
 
         client = null;
         serverConnection = null;
-
-        InvokeLoggedOutEvent();
+        _proxyConnectRequested = false;
     }
 
     public override void OnUpdateLayer()

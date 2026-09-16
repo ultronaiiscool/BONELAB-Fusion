@@ -21,6 +21,8 @@ public sealed class SteamMatchmaker : IMatchmaker
 
     private int _requestEpoch;
     private int _latestRequestId;
+    private int _requestInProgress;
+    private Task<Lobby[]> _activeNativeTask;
 
     public SteamMatchmaker(SteamNetworkLayer owner, int layerGeneration)
     {
@@ -55,6 +57,13 @@ public sealed class SteamMatchmaker : IMatchmaker
 
     private void StartRequest(LobbySearchDelegate searchDelegate, MatchmakerFilters filters, Action<IMatchmaker.MatchmakerCallbackInfo> callback)
     {
+        if (Interlocked.CompareExchange(ref _requestInProgress, 1, 0) != 0)
+        {
+            bool rejectedCompleted = false;
+            Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref rejectedCompleted, Volatile.Read(ref _latestRequestId), "native request already in progress");
+            return;
+        }
+
         var requestId = Interlocked.Increment(ref _latestRequestId);
         var epoch = Volatile.Read(ref _requestEpoch);
 
@@ -69,6 +78,7 @@ public sealed class SteamMatchmaker : IMatchmaker
 
         if (!CanUseRequest(requestId, epoch))
         {
+            FinishRequest(task: null);
             yield break;
         }
 
@@ -80,8 +90,11 @@ public sealed class SteamMatchmaker : IMatchmaker
         {
             FusionLogger.LogException("starting Steam lobby search", e);
             Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref completed, requestId, "start failure");
+            FinishRequest(task: null);
             yield break;
         }
+
+        _activeNativeTask = task;
 
         var started = DateTime.UtcNow;
 
@@ -112,6 +125,7 @@ public sealed class SteamMatchmaker : IMatchmaker
         if (!CanUseRequest(requestId, epoch))
         {
             FusionLogger.Log($"Steam Browse late completion ignored: generation {_layerGeneration}, request {requestId}.");
+            FinishRequest(task);
             yield break;
         }
 
@@ -119,6 +133,7 @@ public sealed class SteamMatchmaker : IMatchmaker
         {
             FusionLogger.LogException("searching for Steam lobbies", task.Exception);
             Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref completed, requestId, "failure");
+            FinishRequest(task);
             yield break;
         }
 
@@ -126,6 +141,7 @@ public sealed class SteamMatchmaker : IMatchmaker
         if (lobbies == null || lobbies.Length == 0)
         {
             Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref completed, requestId, "zero lobbies");
+            FinishRequest(task);
             yield break;
         }
 
@@ -136,6 +152,7 @@ public sealed class SteamMatchmaker : IMatchmaker
             if (!CanUseRequest(requestId, epoch))
             {
                 FusionLogger.Log($"Steam Browse metadata processing cancelled: generation {_layerGeneration}, request {requestId}.");
+                FinishRequest(task);
                 yield break;
             }
 
@@ -173,6 +190,7 @@ public sealed class SteamMatchmaker : IMatchmaker
         };
 
         Complete(callback, info, ref completed, requestId, "success");
+        FinishRequest(task);
     }
 
     private IEnumerator RetainTaskUntilNativeCompletion(Task<Lobby[]> task, int requestId)
@@ -187,6 +205,17 @@ public sealed class SteamMatchmaker : IMatchmaker
         if (task.IsFaulted && task.Exception != null)
         {
             FusionLogger.LogException($"late Steam Browse request {requestId}", task.Exception);
+        }
+
+        FinishRequest(task);
+    }
+
+    private void FinishRequest(Task<Lobby[]> task)
+    {
+        if (task == null || ReferenceEquals(_activeNativeTask, task))
+        {
+            _activeNativeTask = null;
+            Interlocked.Exchange(ref _requestInProgress, 0);
         }
     }
 

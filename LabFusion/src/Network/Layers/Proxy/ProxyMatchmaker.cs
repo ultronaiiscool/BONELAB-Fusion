@@ -13,10 +13,21 @@ public sealed class ProxyMatchmaker : IMatchmaker
 
     private readonly ProxyLobbyManager _lobbyManager;
     private int _latestRequestId;
+    private int _requestEpoch;
+    private int _requestInProgress;
 
     public ProxyMatchmaker(ProxyLobbyManager lobbyManager)
     {
         _lobbyManager = lobbyManager ?? throw new ArgumentNullException(nameof(lobbyManager));
+    }
+
+    public void CancelAll(string reason)
+    {
+        Interlocked.Increment(ref _requestEpoch);
+        Interlocked.Increment(ref _latestRequestId);
+        Volatile.Write(ref _requestInProgress, 0);
+        _lobbyManager.CancelPending();
+        FusionLogger.Log($"Proxy Browse requests cancelled: {reason}.");
     }
 
     public void RequestLobbies(Action<IMatchmaker.MatchmakerCallbackInfo> callback) => RequestLobbies(MatchmakerFilters.Empty, callback);
@@ -57,9 +68,24 @@ public sealed class ProxyMatchmaker : IMatchmaker
 
     private void StartRequest(ProxyLobbyRequestParameters parameters, Action<IMatchmaker.MatchmakerCallbackInfo> callback)
     {
+        if (!NetworkLayerManager.LoggedIn || !ReferenceEquals(NetworkLayerManager.Layer, ProxyNetworkLayer.Instance))
+        {
+            bool unavailableCompleted = false;
+            Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref unavailableCompleted, Volatile.Read(ref _latestRequestId), "proxy layer unavailable");
+            return;
+        }
+
+        if (Interlocked.CompareExchange(ref _requestInProgress, 1, 0) != 0)
+        {
+            bool rejectedCompleted = false;
+            Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref rejectedCompleted, Volatile.Read(ref _latestRequestId), "request already in progress");
+            return;
+        }
+
         var requestId = Interlocked.Increment(ref _latestRequestId);
+        var epoch = Volatile.Read(ref _requestEpoch);
         FusionLogger.Log($"Proxy Browse started: request {requestId}.");
-        MelonCoroutines.Start(FindLobbies(parameters, callback, requestId));
+        MelonCoroutines.Start(FindLobbies(parameters, callback, requestId, epoch));
     }
 
     private static void SendTimeOutNotification()
@@ -74,7 +100,7 @@ public sealed class ProxyMatchmaker : IMatchmaker
         });
     }
 
-    private IEnumerator FindLobbies(ProxyLobbyRequestParameters parameters, Action<IMatchmaker.MatchmakerCallbackInfo> callback, int requestId)
+    private IEnumerator FindLobbies(ProxyLobbyRequestParameters parameters, Action<IMatchmaker.MatchmakerCallbackInfo> callback, int requestId, int epoch)
     {
         bool completed = false;
         Task<ulong[]> task;
@@ -87,13 +113,14 @@ public sealed class ProxyMatchmaker : IMatchmaker
         {
             FusionLogger.LogException("starting proxy lobby request", e);
             Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref completed, requestId, "start failure");
+            FinishRequest(requestId, epoch);
             yield break;
         }
 
         float timeTaken = 0f;
         while (!task.IsCompleted)
         {
-            if (!IsLiveRequest(requestId))
+            if (!IsLiveRequest(requestId, epoch))
             {
                 FusionLogger.Log($"Proxy Browse cancelled/stale: request {requestId}.");
                 yield break;
@@ -107,11 +134,13 @@ public sealed class ProxyMatchmaker : IMatchmaker
                 FusionLogger.Warn($"Proxy Browse timed out requesting lobby IDs: request {requestId}.");
                 SendTimeOutNotification();
                 Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref completed, requestId, "timeout");
+                _lobbyManager.CancelPending();
+                FinishRequest(requestId, epoch);
                 yield break;
             }
         }
 
-        if (!IsLiveRequest(requestId))
+        if (!IsLiveRequest(requestId, epoch))
         {
             FusionLogger.Log($"Proxy Browse late lobby-ID completion ignored: request {requestId}.");
             yield break;
@@ -125,14 +154,16 @@ public sealed class ProxyMatchmaker : IMatchmaker
             }
 
             Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref completed, requestId, "lobby-ID failure");
+            FinishRequest(requestId, epoch);
             yield break;
         }
 
-        List<IMatchmaker.LobbyInfo> netLobbies = new();
+        List<(ulong LobbyId, Task<LobbyMetadataInfo> Task)> metadataTasks = new(task.Result.Length);
+        HashSet<ulong> requestedLobbyIds = new();
 
         foreach (var lobby in task.Result)
         {
-            if (!IsLiveRequest(requestId))
+            if (!IsLiveRequest(requestId, epoch))
             {
                 FusionLogger.Log($"Proxy Browse metadata processing cancelled: request {requestId}.");
                 yield break;
@@ -141,7 +172,13 @@ public sealed class ProxyMatchmaker : IMatchmaker
             Task<LobbyMetadataInfo> metadataTask;
             try
             {
+                if (!requestedLobbyIds.Add(lobby))
+                {
+                    continue;
+                }
+
                 metadataTask = _lobbyManager.RequestLobbyMetadataInfo(lobby);
+                metadataTasks.Add((lobby, metadataTask));
             }
             catch (Exception e)
             {
@@ -149,39 +186,61 @@ public sealed class ProxyMatchmaker : IMatchmaker
                 continue;
             }
 
-            timeTaken = 0f;
-            while (!metadataTask.IsCompleted)
+        }
+
+        bool metadataTimedOut = false;
+        while (true)
+        {
+            bool allCompleted = true;
+            foreach (var request in metadataTasks)
             {
-                if (!IsLiveRequest(requestId))
+                if (!request.Task.IsCompleted)
                 {
-                    FusionLogger.Log($"Proxy Browse metadata request cancelled/stale: request {requestId}.");
-                    yield break;
-                }
-
-                yield return null;
-                timeTaken += TimeReferences.DeltaTime;
-
-                if (timeTaken >= RequestTimeoutSeconds)
-                {
-                    FusionLogger.Warn($"Proxy Browse timed out requesting metadata: request {requestId}.");
-                    SendTimeOutNotification();
-                    Complete(callback, IMatchmaker.MatchmakerCallbackInfo.Empty, ref completed, requestId, "metadata timeout");
-                    yield break;
+                    allCompleted = false;
+                    break;
                 }
             }
 
-            if (!metadataTask.IsCompletedSuccessfully)
+            if (allCompleted)
             {
-                if (metadataTask.Exception != null)
+                break;
+            }
+
+            if (!IsLiveRequest(requestId, epoch))
+            {
+                FusionLogger.Log($"Proxy Browse metadata request cancelled/stale: request {requestId}.");
+                yield break;
+            }
+
+            yield return null;
+            timeTaken += TimeReferences.DeltaTime;
+
+            if (timeTaken >= RequestTimeoutSeconds)
+            {
+                metadataTimedOut = true;
+                FusionLogger.Warn($"Proxy Browse timed out requesting metadata: request {requestId}; returning completed valid lobbies.");
+                SendTimeOutNotification();
+                _lobbyManager.CancelPending();
+                break;
+            }
+        }
+
+        List<IMatchmaker.LobbyInfo> netLobbies = new(metadataTasks.Count);
+
+        foreach (var request in metadataTasks)
+        {
+            if (!request.Task.IsCompletedSuccessfully)
+            {
+                if (request.Task.IsFaulted && request.Task.Exception != null)
                 {
-                    FusionLogger.LogException("requesting proxy lobby metadata", metadataTask.Exception);
+                    FusionLogger.LogException("requesting proxy lobby metadata", request.Task.Exception);
                 }
                 continue;
             }
 
             try
             {
-                var metadata = metadataTask.Result;
+                var metadata = request.Task.Result;
                 if (!metadata.HasLobbyOpen)
                 {
                     continue;
@@ -209,12 +268,23 @@ public sealed class ProxyMatchmaker : IMatchmaker
             Lobbies = netLobbies.ToArray(),
         };
 
-        Complete(callback, info, ref completed, requestId, netLobbies.Count == 0 ? "zero lobbies" : "success");
+        var completionReason = metadataTimedOut ? "partial metadata timeout" : (netLobbies.Count == 0 ? "zero lobbies" : "success");
+        Complete(callback, info, ref completed, requestId, completionReason);
+        FinishRequest(requestId, epoch);
     }
 
-    private bool IsLiveRequest(int requestId)
+    private void FinishRequest(int requestId, int epoch)
+    {
+        if (requestId == Volatile.Read(ref _latestRequestId) && epoch == Volatile.Read(ref _requestEpoch))
+        {
+            Interlocked.Exchange(ref _requestInProgress, 0);
+        }
+    }
+
+    private bool IsLiveRequest(int requestId, int epoch)
     {
         return requestId == Volatile.Read(ref _latestRequestId)
+            && epoch == Volatile.Read(ref _requestEpoch)
             && NetworkLayerManager.LoggedIn
             && ReferenceEquals(NetworkLayerManager.Layer, ProxyNetworkLayer.Instance);
     }
