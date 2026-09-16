@@ -1,0 +1,31 @@
+name: Fetch Upstream Fusion DLL
+
+on:
+  push:
+    branches:
+      - temp/release-v1.14.2-steam-token-repair.1b
+    paths:
+      - .github/workflows/fetch-upstream-dll.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download official v1.14.2 LabFusion.dll
+        shell: bash
+        run: |
+          set -euxo pipefail
+          curl -L --fail --retry 3 -o LabFusion-upstream-1.14.2.dll \
+            https://github.com/Lakatrazz/BONELAB-Fusion/releases/download/v1.14.2/LabFusion.dll
+          echo '0ad09a7ade7b5cabd098bc8d6e038fd0515891b6f0d488d30aab26551ec82a8e  LabFusion-upstream-1.14.2.dll' | sha256sum -c -
+      - name: Upload upstream DLL
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-labfusion-1.14.2
+          path: LabFusion-upstream-1.14.2.dll
+          compression-level: 0
+          retention-days: 1
