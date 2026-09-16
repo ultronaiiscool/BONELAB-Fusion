@@ -70,11 +70,19 @@ public static class ModIOSettings
 
         if (invokeImmediately)
         {
-            InvokeTokenCallback(loadCallback, cachedToken);
+            // Preserve the original asynchronous contract. Invoking a cached callback
+            // inline allows a callback that calls LoadToken again to recurse forever.
+            MelonCoroutines.Start(CoInvokeTokenCallback(loadCallback, cachedToken));
             return;
         }
 
         MelonCoroutines.Start(CoLoadToken());
+    }
+
+    private static IEnumerator CoInvokeTokenCallback(Action<string> callback, string token)
+    {
+        yield return null;
+        InvokeTokenCallback(callback, token);
     }
 
     private static IEnumerator CoLoadToken()

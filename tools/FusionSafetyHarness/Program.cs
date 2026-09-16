@@ -89,6 +89,7 @@ sealed class LifecycleModel
 sealed class TokenCacheModel
 {
     private readonly Func<string?> _read;
+    private readonly object _lock = new();
     private bool _checked;
     public int ReadCount { get; private set; }
     public string? Cached { get; private set; }
@@ -97,12 +98,98 @@ sealed class TokenCacheModel
 
     public string? Load()
     {
-        if (_checked) return Cached;
-        _checked = true;
-        ReadCount++;
-        Cached = _read()?.Trim();
-        if (string.IsNullOrWhiteSpace(Cached)) Cached = null;
-        return Cached;
+        lock (_lock)
+        {
+            if (_checked) return Cached;
+            _checked = true;
+            ReadCount++;
+            Cached = _read()?.Trim();
+            if (string.IsNullOrWhiteSpace(Cached)) Cached = null;
+            return Cached;
+        }
+    }
+}
+
+sealed class LoginAttemptModel
+{
+    public int Generation { get; private set; }
+    public int TerminalResults { get; private set; }
+    public bool Pending { get; private set; }
+    public bool LoggedIn { get; private set; }
+
+    public int Begin()
+    {
+        if (Pending || LoggedIn) return Generation;
+        Pending = true;
+        return ++Generation;
+    }
+
+    public void Complete(int generation)
+    {
+        if (!Pending || generation != Generation) return;
+        Pending = false;
+        LoggedIn = true;
+        TerminalResults++;
+    }
+
+    public void Timeout(int generation)
+    {
+        if (!Pending || generation != Generation) return;
+        Pending = false;
+        TerminalResults++;
+    }
+
+    public void Logout()
+    {
+        if (!Pending && !LoggedIn) return;
+        Generation++;
+        Pending = false;
+        LoggedIn = false;
+        TerminalResults++;
+    }
+}
+
+sealed class BrowseGateModel
+{
+    public bool Active { get; private set; }
+    public int NativeRequests { get; private set; }
+    public int CallbackCount { get; private set; }
+
+    public void Start()
+    {
+        if (Active)
+        {
+            CallbackCount++;
+            return;
+        }
+
+        Active = true;
+        NativeRequests++;
+    }
+
+    public void Complete()
+    {
+        if (!Active) return;
+        Active = false;
+        CallbackCount++;
+    }
+
+    public void Cancel() => Active = false;
+}
+
+static class ProxyInputModel
+{
+    public static bool AcceptLobbyList(uint count, int availableBytes)
+        => count <= 256 && availableBytes >= checked((int)count * sizeof(ulong));
+
+    public static int RetainValidMetadata(params bool[] validEntries)
+    {
+        var retained = 0;
+        foreach (var valid in validEntries)
+        {
+            if (valid) retained++;
+        }
+        return retained;
     }
 }
 
@@ -192,6 +279,50 @@ internal static class Program
             ("20 independent subscribers do not suppress one another", () => {
                 var callbacks = new ConcurrentBag<int>(); Action<int> a = callbacks.Add; Action<int> b = callbacks.Add; a(1); b(2);
                 AssertEx.Equal(2, callbacks.Count, "both subscribers invoked");
+            }),
+            ("21 Helper available completes login once", () => {
+                var m = new LoginAttemptModel(); var generation = m.Begin(); m.Complete(generation); m.Complete(generation);
+                AssertEx.True(m.LoggedIn, "Helper login succeeds"); AssertEx.Equal(1, m.TerminalResults, "single terminal result");
+            }),
+            ("22 Helper discovery timeout is terminal", () => {
+                var m = new LoginAttemptModel(); var generation = m.Begin(); m.Timeout(generation);
+                AssertEx.True(!m.Pending && !m.LoggedIn, "timeout ends login"); AssertEx.Equal(1, m.TerminalResults, "timeout result");
+            }),
+            ("23 logout during login invalidates attempt", () => {
+                var m = new LoginAttemptModel(); var generation = m.Begin(); m.Logout(); m.Complete(generation);
+                AssertEx.True(!m.Pending && !m.LoggedIn, "logout wins"); AssertEx.Equal(1, m.TerminalResults, "logout result");
+            }),
+            ("24 old Helper callback cannot log in new generation", () => {
+                var m = new LoginAttemptModel(); var oldGeneration = m.Begin(); m.Logout(); var newGeneration = m.Begin(); m.Complete(oldGeneration);
+                AssertEx.True(m.Pending && !m.LoggedIn, "old callback ignored"); m.Complete(newGeneration); AssertEx.True(m.LoggedIn, "new callback accepted");
+            }),
+            ("25 repeated connect disconnect cycles remain recoverable", () => {
+                var m = new LoginAttemptModel();
+                for (var i = 0; i < 10; i++) { var generation = m.Begin(); m.Complete(generation); m.Logout(); }
+                AssertEx.True(!m.Pending && !m.LoggedIn, "final state logged out"); AssertEx.Equal(20, m.TerminalResults, "all cycles terminal");
+            }),
+            ("26 rapid Browse presses launch one native request", () => {
+                var m = new BrowseGateModel(); m.Start(); m.Start(); m.Start();
+                AssertEx.Equal(1, m.NativeRequests, "one native request"); AssertEx.Equal(2, m.CallbackCount, "rejected requests complete"); m.Complete(); AssertEx.Equal(3, m.CallbackCount, "active request completes");
+            }),
+            ("27 malformed proxy lobby count is rejected", () => {
+                AssertEx.True(!ProxyInputModel.AcceptLobbyList(257, 4096), "count cap");
+                AssertEx.True(!ProxyInputModel.AcceptLobbyList(2, 8), "length validation");
+                AssertEx.True(ProxyInputModel.AcceptLobbyList(2, 16), "valid list");
+            }),
+            ("28 malformed metadata is skipped while valid lobbies remain", () => {
+                AssertEx.Equal(2, ProxyInputModel.RetainValidMetadata(true, false, true, false), "valid lobby retention");
+            }),
+            ("29 concurrent token callers share one read", () => {
+                var c = new TokenCacheModel(() => " shared-token ");
+                Parallel.For(0, 32, _ => AssertEx.Equal("shared-token", c.Load()!, "shared token"));
+                AssertEx.Equal(1, c.ReadCount, "single concurrent read");
+            }),
+            ("30 normal token fallback remains available", () => {
+                var external = new TokenCacheModel(() => "  ");
+                var fallback = new TokenCacheModel(() => " normal-token ");
+                var token = external.Load() ?? fallback.Load();
+                AssertEx.Equal("normal-token", token!, "fallback token");
             }),
         };
 
