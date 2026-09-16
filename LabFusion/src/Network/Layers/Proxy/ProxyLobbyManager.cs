@@ -3,8 +3,6 @@
 using LiteNetLib;
 using LiteNetLib.Utils;
 
-using MelonLoader;
-
 namespace LabFusion.Network.Proxy;
 
 public class ProxyLobbyManager
@@ -18,20 +16,31 @@ public class ProxyLobbyManager
         _networkLayer = networkLayer;
     }
 
+    internal void CancelPending()
+    {
+        _lobbyIdSource?.TrySetResult(Array.Empty<ulong>());
+        _lobbyIdSource = null;
+
+        foreach (var request in _metadataInfoRequests.Values)
+        {
+            request.TrySetCanceled();
+        }
+
+        _metadataInfoRequests.Clear();
+    }
+
     internal void HandleLobbyMessage(MessageTypes messageType, NetPacketReader packetReader)
     {
         if (messageType == MessageTypes.LobbyIDs)
         {
-            MelonLogger.Msg("Got LobbyIds");
-            if (_lobbyIdSource == null)
+            var source = _lobbyIdSource;
+            if (source == null)
             {
-                MelonLogger.Error("Got extraneous RequestLobbies response?");
+                FusionLogger.Warn("Ignoring an unexpected proxy lobby-list response.");
                 return;
             }
 
-            // Got a lobby response from the server, read the SteamIDs
             uint numLobbyIds = packetReader.GetUInt();
-
             ulong[] ids = new ulong[numLobbyIds];
 
             for (uint i = 0; i < numLobbyIds; i++)
@@ -39,54 +48,59 @@ public class ProxyLobbyManager
                 ids[i] = packetReader.GetULong();
             }
 
-            // Finish the task
-            _lobbyIdSource.SetResult(ids);
             _lobbyIdSource = null;
+            source.TrySetResult(ids);
         }
 
         if (messageType == MessageTypes.LobbyMetadata)
         {
             ulong lobbyId = packetReader.GetULong();
-            FusionLogger.Log($"Got LobbyMetadata for {lobbyId}");
 
-            if (!_metadataInfoRequests.ContainsKey(lobbyId))
+            if (!_metadataInfoRequests.TryGetValue(lobbyId, out var source))
             {
-                FusionLogger.Error("Got extraneous LobbyMetadata response?");
+                FusionLogger.Warn("Ignoring unexpected proxy lobby metadata.");
                 return;
             }
 
-            var tcs = _metadataInfoRequests[lobbyId];
-
-            ProxyNetworkLobby lobby = new();
-
-            // Get the amount of keys
-            int keyCount = packetReader.GetInt();
-
-            // Read key array
-            for (var i = 0; i < keyCount; i++)
-            {
-                // In order, key then value
-                string key = packetReader.GetString();
-                string value = packetReader.GetString();
-
-                lobby.CacheMetadata(key, value);
-            }
-
-            LobbyMetadataInfo info = LobbyMetadataSerializer.ReadInfo(lobby);
-
-            tcs.SetResult(info);
             _metadataInfoRequests.Remove(lobbyId);
+
+            try
+            {
+                ProxyNetworkLobby lobby = new();
+                int keyCount = packetReader.GetInt();
+
+                if (keyCount < 0 || keyCount > 1024)
+                {
+                    throw new InvalidDataException("Proxy lobby metadata key count was outside the accepted range.");
+                }
+
+                for (var i = 0; i < keyCount; i++)
+                {
+                    string key = packetReader.GetString();
+                    string value = packetReader.GetString();
+                    lobby.CacheMetadata(key, value);
+                }
+
+                LobbyMetadataInfo info = LobbyMetadataSerializer.ReadInfo(lobby);
+                source.TrySetResult(info);
+            }
+            catch (Exception e)
+            {
+                FusionLogger.LogException("parsing proxy lobby metadata", e);
+                source.TrySetException(e);
+            }
         }
     }
 
     public Task<ulong[]> RequestLobbyIDs(ProxyLobbyRequestParameters parameters)
     {
+        // Only one list request is meaningful at a time. Finish the older request
+        // deterministically instead of overwriting its TaskCompletionSource forever.
+        _lobbyIdSource?.TrySetResult(Array.Empty<ulong>());
         _lobbyIdSource = new TaskCompletionSource<ulong[]>();
 
         NetDataWriter writer = ProxyNetworkLayer.NewWriter(MessageTypes.LobbyIDs);
-
         parameters.Put(writer);
-
         _networkLayer.SendToProxyServer(writer);
 
         return _lobbyIdSource.Task;
@@ -94,12 +108,18 @@ public class ProxyLobbyManager
 
     public Task<LobbyMetadataInfo> RequestLobbyMetadataInfo(ulong lobbyId)
     {
-        var tcs = new TaskCompletionSource<LobbyMetadataInfo>();
-        _metadataInfoRequests.Add(lobbyId, tcs);
+        if (_metadataInfoRequests.TryGetValue(lobbyId, out var existing))
+        {
+            return existing.Task;
+        }
+
+        var source = new TaskCompletionSource<LobbyMetadataInfo>();
+        _metadataInfoRequests.Add(lobbyId, source);
+
         NetDataWriter writer = ProxyNetworkLayer.NewWriter(MessageTypes.LobbyMetadata);
         writer.Put(lobbyId);
         _networkLayer.SendToProxyServer(writer);
 
-        return tcs.Task;
+        return source.Task;
     }
 }
