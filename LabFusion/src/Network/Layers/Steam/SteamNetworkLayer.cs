@@ -10,6 +10,9 @@ using LabFusion.Senders;
 using LabFusion.Voice;
 using LabFusion.Voice.Unity;
 
+using MelonLoader;
+using System.Collections;
+
 namespace LabFusion.Network;
 
 public abstract class SteamNetworkLayer : NetworkLayer
@@ -17,9 +20,9 @@ public abstract class SteamNetworkLayer : NetworkLayer
     public abstract uint ApplicationID { get; }
 
     public const int ReceiveBufferSize = 32;
+    private const float LobbyCreationTimeoutSeconds = 15f;
 
     public override string Title => "Steam";
-
     public override string Platform => "Steam";
 
     public override bool IsHost => _isServerActive;
@@ -31,7 +34,7 @@ public abstract class SteamNetworkLayer : NetworkLayer
     private IVoiceManager _voiceManager = null;
     public override IVoiceManager VoiceManager => _voiceManager;
 
-    private IMatchmaker _matchmaker = null;
+    private SteamMatchmaker _matchmaker = null;
     public override IMatchmaker Matchmaker => _matchmaker;
 
     public SteamId SteamId;
@@ -42,9 +45,23 @@ public abstract class SteamNetworkLayer : NetworkLayer
     protected bool _isServerActive = false;
     protected bool _isConnectionActive = false;
 
-    // A local reference to a lobby
-    // This isn't actually used for joining servers, just for matchmaking
     protected Lobby _localLobby;
+
+    private bool _isLayerInitialized;
+    private bool _isLoggedIn;
+    private int _generation;
+
+    private static int _nextGeneration;
+    private static bool _fusionOwnsSteamClient;
+    private static uint _fusionApplicationId;
+    private static bool _loggedUnsafeGameSteamContext;
+
+    internal int Generation => _generation;
+
+    internal bool IsGenerationCurrent(int generation)
+    {
+        return _isLoggedIn && _isLayerInitialized && generation == _generation && SteamClient.IsValid;
+    }
 
     public override bool CheckSupported()
     {
@@ -53,115 +70,184 @@ public abstract class SteamNetworkLayer : NetworkLayer
 
     public override bool CheckValidation()
     {
-        return SteamAPILoader.HasSteamAPI;
+        if (!SteamAPILoader.HasSteamAPI)
+        {
+            return false;
+        }
+
+        // Facepunch.Steamworks in this repository is a static, process-wide client.
+        // Initializing it for SteamVR (250820) requires changing SteamAppId/SteamGameId.
+        // Never do that after BONELAB has already initialized its own Steam client.
+        if (GameHasSteamworks() && !SteamClient.IsValid)
+        {
+            if (!_loggedUnsafeGameSteamContext)
+            {
+                FusionLogger.Warn("BONELAB already owns the process Steam context. Refusing unsafe in-process Steam reinitialization; an isolated proxy layer will be used when available.");
+                _loggedUnsafeGameSteamContext = true;
+            }
+
+            return false;
+        }
+
+        if (SteamClient.IsValid && (!_fusionOwnsSteamClient || _fusionApplicationId != ApplicationID))
+        {
+            FusionLogger.Error("A Steam client is already initialized with unknown or incompatible ownership. Refusing to reuse it for Fusion.");
+            return false;
+        }
+
+        return true;
     }
 
     public override void OnInitializeLayer()
     {
-        if (!SteamClient.IsValid)
+        if (_isLayerInitialized)
         {
-            FusionLogger.Error("Steamworks failed to initialize!");
             return;
         }
 
-        // Get steam information
+        if (!SteamClient.IsValid || !_fusionOwnsSteamClient || _fusionApplicationId != ApplicationID)
+        {
+            FusionLogger.Error("Steamworks is not in a Fusion-owned compatible state; refusing layer initialization.");
+            return;
+        }
+
+        _isLayerInitialized = true;
+
         SteamId = SteamClient.SteamId;
         PlayerIDManager.SetLongID(SteamId.Value);
         LocalPlayer.Username = GetUsername(SteamId.Value);
 
-        FusionLogger.Log($"Steamworks initialized with SteamID {SteamId} and ApplicationID {ApplicationID}!");
+        FusionLogger.Log($"Steamworks initialized for ApplicationID {ApplicationID}; generation {_generation}.");
 
         SteamNetworkingUtils.InitRelayNetworkAccess();
 
         HookSteamEvents();
 
-        // Create managers
         _voiceManager = new UnityVoiceManager();
         _voiceManager.Enable();
 
-        _matchmaker = new SteamMatchmaker();
+        _matchmaker = new SteamMatchmaker(this, _generation);
     }
 
     public override void OnDeinitializeLayer()
     {
-        _voiceManager.Disable();
-        _voiceManager = null;
+        // Invalidate requests before touching any managed state. We deliberately do
+        // not call SteamAPI.Shutdown/SteamClient.Shutdown here: native async calls may
+        // still own callbacks/handles, and BONELAB may own the process Steam lifetime.
+        _isLoggedIn = false;
+        _generation = Interlocked.Increment(ref _nextGeneration);
 
+        _matchmaker?.CancelAll("network layer deinitialized");
+
+        if (!_isLayerInitialized)
+        {
+            return;
+        }
+
+        Disconnect();
+        UnHookSteamEvents();
+
+        _voiceManager?.Disable();
+        _voiceManager = null;
         _matchmaker = null;
 
         _localLobby = default;
         _currentLobby = null;
+        _isLayerInitialized = false;
 
-        Disconnect();
-
-        UnHookSteamEvents();
-
-        SteamAPI.Shutdown();
+        FusionLogger.Log($"Steam network layer deinitialized; generation {_generation}. Native Steam client retained for process lifetime to avoid invalidating outstanding native callbacks.");
     }
 
     public override void LogIn()
     {
-        if (SteamClient.IsValid)
+        if (_isLoggedIn)
         {
             return;
         }
 
-        // Shutdown the game's steam client, if available
-        if (GameHasSteamworks())
+        if (SteamClient.IsValid)
         {
-            ShutdownGameClient();
+            if (!_fusionOwnsSteamClient || _fusionApplicationId != ApplicationID)
+            {
+                FailLogin("Steam is already initialized by another owner or App ID. Fusion will not take over that process-wide client.");
+                return;
+            }
+
+            _generation = Interlocked.Increment(ref _nextGeneration);
+            _isLoggedIn = true;
+            InvokeLoggedInEvent();
+            return;
         }
 
-        bool succeeded;
+        // Never shut down BONELAB's Steamworks instance. The previous implementation
+        // did so, changed SteamAppId/SteamGameId, then reinitialized the same process
+        // as App 250820. That invalidates native ownership/callback assumptions.
+        if (GameHasSteamworks())
+        {
+            FailLogin("BONELAB already owns Steam in this process. Use the isolated Proxy SteamVR layer with Fusion Helper.");
+            return;
+        }
 
         try
         {
             SteamClient.Init(ApplicationID, false);
-
-            succeeded = true;
+            _fusionOwnsSteamClient = true;
+            _fusionApplicationId = ApplicationID;
         }
         catch (Exception e)
         {
-            FusionLogger.LogException("initializing Steamworks", e);
-
-            succeeded = false;
-        }
-
-        if (!succeeded)
-        {
-            Notifier.Send(new Notification()
-            {
-                Title = "Log In Failed",
-                Message = "Failed connecting to Steamworks! Make sure Steam is running and signed in!",
-                SaveToMenu = false,
-                ShowPopup = true,
-                Type = NotificationType.ERROR,
-                PopupLength = 6f,
-            });
-
-            InvokeLoggedOutEvent();
+            FusionLogger.LogException("initializing Fusion-owned Steamworks", e);
+            FailLogin("Failed connecting to Steamworks. Make sure Steam is running and signed in.");
             return;
         }
 
+        _generation = Interlocked.Increment(ref _nextGeneration);
+        _isLoggedIn = true;
         InvokeLoggedInEvent();
     }
 
     public override void LogOut()
     {
-        SteamClient.Shutdown();
+        if (!_isLoggedIn && !_isLayerInitialized)
+        {
+            return;
+        }
 
+        _isLoggedIn = false;
+        _generation = Interlocked.Increment(ref _nextGeneration);
+        _matchmaker?.CancelAll("logout");
+
+        // Do not destroy the static native Steam context here. Facepunch's async
+        // lobby calls do not expose a supported cancellation primitive, so shutdown
+        // while one is pending can leave native callbacks targeting freed state.
+        InvokeLoggedOutEvent();
+    }
+
+    private void FailLogin(string message)
+    {
+        FusionLogger.Error(message);
+
+        Notifier.Send(new Notification()
+        {
+            Title = "Log In Failed",
+            Message = message,
+            SaveToMenu = false,
+            ShowPopup = true,
+            Type = NotificationType.ERROR,
+            PopupLength = 8f,
+        });
+
+        _isLoggedIn = false;
         InvokeLoggedOutEvent();
     }
 
     private const string STEAMWORKS_ASSEMBLY_NAME = "Il2CppFacepunch.Steamworks.Win64";
 
-    private static bool GameHasSteamworks()
+    internal static bool GameHasSteamworks()
     {
-        var assemblies = AppDomain.CurrentDomain.GetAssemblies();
-
-        foreach (var assembly in assemblies)
+        foreach (var assembly in AppDomain.CurrentDomain.GetAssemblies())
         {
-            if (assembly.FullName.StartsWith(STEAMWORKS_ASSEMBLY_NAME))
+            if (assembly.FullName?.StartsWith(STEAMWORKS_ASSEMBLY_NAME) == true)
             {
                 return true;
             }
@@ -170,23 +256,18 @@ public abstract class SteamNetworkLayer : NetworkLayer
         return false;
     }
 
-    private static void ShutdownGameClient()
-    {
-        FusionLogger.Log("Shutting down the game's Steamworks instance...");
-
-        Il2CppSteamworks.SteamClient.Shutdown();
-    }
-
     public override void OnUpdateLayer()
     {
-        // Run callbacks for our client
+        if (!SteamClient.IsValid || !_fusionOwnsSteamClient)
+        {
+            return;
+        }
+
         SteamClient.RunCallbacks();
 
-        // Receive any needed messages
         try
         {
             SteamSocket?.Receive(ReceiveBufferSize);
-
             SteamConnection?.Receive(ReceiveBufferSize);
         }
         catch (Exception e)
@@ -225,7 +306,6 @@ public abstract class SteamNetworkLayer : NetworkLayer
     public override void SendFromServer(byte userId, NetworkChannel channel, NetMessage message)
     {
         var id = PlayerIDManager.GetPlayerID(userId);
-
         if (id != null)
         {
             SendFromServer(id.PlatformID, channel, message);
@@ -234,13 +314,11 @@ public abstract class SteamNetworkLayer : NetworkLayer
 
     public override void SendFromServer(ulong userId, NetworkChannel channel, NetMessage message)
     {
-        // Make sure this is actually the server
         if (!IsHost)
         {
             return;
         }
 
-        // Get the connection from the userid dictionary
         if (SteamSocket.ConnectedSteamIDs.TryGetValue(userId, out var connection))
         {
             SteamSocket.SendToClient(connection, channel, message);
@@ -250,24 +328,20 @@ public abstract class SteamNetworkLayer : NetworkLayer
     public override void StartServer()
     {
         SteamSocket = SteamNetworkingSockets.CreateRelaySocket<SteamSocketManager>(0);
-
-        // Host needs to connect to own socket server with a ConnectionManager to send/receive messages
-        // Relay Socket servers are created/connected to through SteamIds rather than "Normal" Socket Servers which take IP addresses
         SteamConnection = SteamNetworkingSockets.ConnectRelay<SteamConnectionManager>(SteamId);
         _isServerActive = true;
         _isConnectionActive = true;
 
-        // Call server setup
         InternalServerHelpers.OnStartServer();
-
         RefreshServerCode();
     }
 
     public void JoinServer(SteamId serverId)
     {
-        // Leave existing server
         if (_isConnectionActive || _isServerActive)
+        {
             Disconnect();
+        }
 
         SteamConnection = SteamNetworkingSockets.ConnectRelay<SteamConnectionManager>(serverId, 0);
 
@@ -279,19 +353,24 @@ public abstract class SteamNetworkLayer : NetworkLayer
 
     public override void Disconnect(string reason = "")
     {
-        // Make sure we are currently in a server
         if (!_isServerActive && !_isConnectionActive)
+        {
             return;
+        }
 
         try
         {
             SteamConnection?.Close();
-
             SteamSocket?.Close();
         }
-        catch
+        catch (Exception e)
         {
-            FusionLogger.Log("Error closing socket server / connection manager");
+            FusionLogger.LogException("closing Steam socket/connection", e);
+        }
+        finally
+        {
+            SteamConnection = null;
+            SteamSocket = null;
         }
 
         _isServerActive = false;
@@ -302,13 +381,12 @@ public abstract class SteamNetworkLayer : NetworkLayer
 
     public override void DisconnectUser(ulong platformID)
     {
-        // Make sure we are hosting a server
         if (!_isServerActive)
         {
             return;
         }
 
-        SteamSocket.DisconnectUser(platformID);
+        SteamSocket?.DisconnectUser(platformID);
     }
 
     public string ServerCode { get; private set; } = null;
@@ -321,24 +399,19 @@ public abstract class SteamNetworkLayer : NetworkLayer
     public override void RefreshServerCode()
     {
         ServerCode = RandomCodeGenerator.GetString(8);
-
         LobbyInfoManager.PushLobbyUpdate();
     }
 
     public override void JoinServerByCode(string code)
     {
-        if (Matchmaker == null)
+        if (Matchmaker == null || string.IsNullOrWhiteSpace(code))
         {
             return;
         }
 
-#if DEBUG
-        FusionLogger.Log($"Searching for servers with code {code}...");
-#endif
-
         Matchmaker.RequestLobbiesByCode(code, (info) =>
         {
-            if (info.Lobbies.Length <= 0)
+            if (!IsGenerationCurrent(_generation) || info.Lobbies.Length <= 0)
             {
                 return;
             }
@@ -349,25 +422,17 @@ public abstract class SteamNetworkLayer : NetworkLayer
 
     private void HookSteamEvents()
     {
-        // Add server hooks
         MultiplayerHooking.OnPlayerJoined += OnPlayerJoin;
         MultiplayerHooking.OnPlayerLeft += OnPlayerLeave;
         MultiplayerHooking.OnDisconnected += OnDisconnect;
-
         LobbyInfoManager.OnLobbyInfoChanged += OnUpdateLobby;
 
-        // Create a local lobby
-        AwaitLobbyCreation();
+        MelonCoroutines.Start(AwaitLobbyCreation(_generation));
     }
 
     private void OnPlayerJoin(PlayerID id)
     {
-        if (VoiceManager == null)
-        {
-            return;
-        }
-
-        if (!id.IsMe)
+        if (VoiceManager != null && !id.IsMe)
         {
             VoiceManager.GetSpeaker(id);
         }
@@ -375,68 +440,98 @@ public abstract class SteamNetworkLayer : NetworkLayer
 
     private void OnPlayerLeave(PlayerID id)
     {
-        if (VoiceManager == null)
-        {
-            return;
-        }
-
-        VoiceManager.RemoveSpeaker(id);
+        VoiceManager?.RemoveSpeaker(id);
     }
 
     private void OnDisconnect()
     {
-        if (VoiceManager == null)
-        {
-            return;
-        }
-
-        VoiceManager.ClearManager();
+        VoiceManager?.ClearManager();
     }
 
     private void UnHookSteamEvents()
     {
-        // Remove server hooks
         MultiplayerHooking.OnPlayerJoined -= OnPlayerJoin;
         MultiplayerHooking.OnPlayerLeft -= OnPlayerLeave;
         MultiplayerHooking.OnDisconnected -= OnDisconnect;
-
         LobbyInfoManager.OnLobbyInfoChanged -= OnUpdateLobby;
 
-        // Remove the local lobby
-        if (_localLobby.Id == SteamId)
+        try
         {
-            _localLobby.Leave();
+            if (_localLobby.Id == SteamId)
+            {
+                _localLobby.Leave();
+            }
+        }
+        catch (Exception e)
+        {
+            FusionLogger.LogException("leaving local Steam lobby", e);
         }
     }
 
-    private async void AwaitLobbyCreation()
+    private IEnumerator AwaitLobbyCreation(int generation)
     {
-        var lobbyTask = await SteamMatchmaking.CreateLobbyAsync();
+        Task<Lobby?> task;
 
-        if (!lobbyTask.HasValue)
+        try
         {
-#if DEBUG
-            FusionLogger.Log("Failed to create a steam lobby!");
-#endif
-            return;
+            task = SteamMatchmaking.CreateLobbyAsync();
+        }
+        catch (Exception e)
+        {
+            FusionLogger.LogException("starting local Steam lobby creation", e);
+            yield break;
         }
 
-        _localLobby = lobbyTask.Value;
+        var started = DateTime.UtcNow;
+
+        while (!task.IsCompleted)
+        {
+            if (!IsGenerationCurrent(generation))
+            {
+                FusionLogger.Log($"Ignoring local Steam lobby creation from stale generation {generation}.");
+                yield break;
+            }
+
+            if ((DateTime.UtcNow - started).TotalSeconds >= LobbyCreationTimeoutSeconds)
+            {
+                FusionLogger.Warn($"Local Steam lobby creation timed out for generation {generation}; late completion will be ignored.");
+                yield break;
+            }
+
+            yield return null;
+        }
+
+        if (!IsGenerationCurrent(generation))
+        {
+            FusionLogger.Log($"Ignoring completed local Steam lobby from stale generation {generation}.");
+            yield break;
+        }
+
+        if (!task.IsCompletedSuccessfully || !task.Result.HasValue)
+        {
+            if (task.Exception != null)
+            {
+                FusionLogger.LogException("creating local Steam lobby", task.Exception);
+            }
+            else
+            {
+                FusionLogger.Warn("Failed to create a Steam lobby.");
+            }
+
+            yield break;
+        }
+
+        _localLobby = task.Result.Value;
         _currentLobby = new SteamLobby(_localLobby);
     }
 
     public void OnUpdateLobby()
     {
-        // Make sure the lobby exists
         if (Lobby == null)
         {
-#if DEBUG
-            FusionLogger.Warn("Tried updating the steam lobby, but it was null!");
-#endif
             return;
         }
 
-        // Write active info about the lobby
         LobbyMetadataSerializer.WriteInfo(Lobby);
     }
 }
