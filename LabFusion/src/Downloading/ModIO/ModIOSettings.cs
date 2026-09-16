@@ -13,11 +13,10 @@ namespace LabFusion.Downloading.ModIO;
 
 public static class ModIOSettings
 {
-    public const string ApiPath = "https://api.mod.io/v1/games/";
-    public const int GameID = 3809; // BONELAB GameID
+    public static int GameID { get; set; } = 3809; // BONELAB GameID
     public const string ExternalTokenFileName = "FusionModIOToken.txt";
 
-    public static string GameApiPath => $"{ApiPath}{GameID}/mods/";
+    public static string GameApiPath => $"https://g-{GameID}.modapi.io/v1/games/{GameID}/mods/";
     public static string ExternalTokenPath => Path.Combine(MelonEnvironment.UserDataDirectory, ExternalTokenFileName);
 
     private static readonly object _tokenLock = new();
