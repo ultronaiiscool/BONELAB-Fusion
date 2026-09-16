@@ -11,6 +11,8 @@ namespace LabFusion.Downloading.ModIO;
 
 public static class ModIODownloader
 {
+    private const int RequestAttempts = 3;
+
     private static ModTransaction _currentTransaction = default;
     private static bool _isDownloading = false;
 
@@ -202,76 +204,112 @@ public static class ModIODownloader
         using HttpClient client = new(handler);
         client.DefaultRequestHeaders.Add("Authorization", "Bearer " + token);
 
-        var responseTask = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
-
-        while (!responseTask.IsCompleted)
+        HttpResponseMessage response = null;
+        for (var attempt = 1; attempt <= RequestAttempts; attempt++)
         {
-            yield return null;
+            Task<HttpResponseMessage> responseTask;
+            try
+            {
+                responseTask = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead);
+            }
+            catch (Exception e)
+            {
+                FusionLogger.LogException($"starting mod.io download for mod {modFile.ModID}, file {modFile.FileID} (attempt {attempt}/{RequestAttempts})", e);
+                continue;
+            }
+
+            while (!responseTask.IsCompleted)
+            {
+                yield return null;
+            }
+
+            if (!responseTask.IsCompletedSuccessfully)
+            {
+                FusionLogger.LogException($"requesting mod.io download for mod {modFile.ModID}, file {modFile.FileID} (attempt {attempt}/{RequestAttempts})", responseTask.Exception);
+                continue;
+            }
+
+            var candidate = responseTask.Result;
+            if (candidate.IsSuccessStatusCode)
+            {
+                response = candidate;
+                break;
+            }
+
+            FusionLogger.Warn($"mod.io download for mod {modFile.ModID}, file {modFile.FileID} returned HTTP {(int)candidate.StatusCode} (attempt {attempt}/{RequestAttempts}).");
+            candidate.Dispose();
+
+            if ((int)candidate.StatusCode < 500)
+            {
+                break;
+            }
         }
 
-        // Make sure the response was successful
-        if (!responseTask.IsCompletedSuccessfully)
+        if (response == null)
         {
-            FusionLogger.LogException("getting response from mod.io", responseTask.Exception);
-
             FailDownload();
-
             yield break;
         }
 
         // Get the resulting content
-        var content = responseTask.Result.Content;
-        var contentLength = content.Headers.ContentLength.Value;
-
-        // Check if the file size is too large to download
-        var maxBytes = transaction.MaxBytes;
-
-        if (maxBytes.HasValue && contentLength > maxBytes.Value)
+        using (response)
         {
-            FusionLogger.Warn($"Skipped download of mod {modFile.ModID} due to the file size being too large.");
+            var content = response.Content;
+            var contentLength = content.Headers.ContentLength;
 
-            FailDownload();
+            // Check if the file size is too large to download
+            var maxBytes = transaction.MaxBytes;
 
-            yield break;
-        }
-
-        // Install the content into a zip file
-        var zipPath = ModDownloadManager.DownloadPath + $"/m{modFile.ModID}f{modFile.FileID}.zip";
-
-        // Make sure this using statement ends before we load the pallet, so that the file is not in use
-        using (var copyStream = new FileStream(zipPath, FileMode.Create))
-        {
-            var copyTask = content.CopyToAsync(copyStream);
-
-            while (!copyTask.IsCompleted)
+            if (maxBytes.HasValue && contentLength.HasValue && contentLength.Value > maxBytes.Value)
             {
-                transaction.Report((float)copyStream.Length / contentLength);
-
-                yield return null;
-            }
-
-            if (!copyTask.IsCompletedSuccessfully)
-            {
-                FusionLogger.LogException("copying downloaded zip", copyTask.Exception);
+                FusionLogger.Warn($"Skipped download of mod {modFile.ModID} due to the file size being too large.");
 
                 FailDownload();
 
                 yield break;
             }
-        }
 
-        // Set progress to 100%
-        transaction.Report(1f);
+            // Install the content into a zip file
+            var zipPath = ModDownloadManager.DownloadPath + $"/m{modFile.ModID}f{modFile.FileID}.zip";
 
-        // Load the pallet
-        ModDownloadManager.LoadPalletFromZip(zipPath, modFile, transaction.Temporary, OnScheduledLoad, transaction.Callback);
+            // Make sure this using statement ends before we load the pallet, so that the file is not in use
+            using (var copyStream = new FileStream(zipPath, FileMode.Create))
+            {
+                var copyTask = content.CopyToAsync(copyStream);
 
-        void OnScheduledLoad()
-        {
-            // Delete temp zip
-            File.Delete(zipPath);
+                while (!copyTask.IsCompleted)
+                {
+                    if (contentLength.GetValueOrDefault() > 0)
+                    {
+                        transaction.Report((float)copyStream.Length / contentLength.Value);
+                    }
 
-            EndDownload();
+                    yield return null;
+                }
+
+                if (!copyTask.IsCompletedSuccessfully)
+                {
+                    FusionLogger.LogException($"copying downloaded zip for mod {modFile.ModID}, file {modFile.FileID}", copyTask.Exception);
+
+                    FailDownload();
+
+                    yield break;
+                }
+            }
+
+            // Set progress to 100%
+            transaction.Report(1f);
+
+            // Load the pallet
+            ModDownloadManager.LoadPalletFromZip(zipPath, modFile, transaction.Temporary, OnScheduledLoad, transaction.Callback);
+
+            void OnScheduledLoad()
+            {
+                // Delete temp zip
+                File.Delete(zipPath);
+
+                EndDownload();
+            }
         }
 
         void FailDownload()

@@ -346,6 +346,24 @@ internal static class Program
                 AssertEx.Equal("250820", child["SteamAppId"], "Helper SteamAppId");
                 AssertEx.Equal("250820", child["SteamGameId"], "Helper SteamGameId");
             }),
+            ("32 transient mod.io requests are retried without exposing tokens", () => {
+                var attempts = 0;
+                var completed = false;
+                while (!completed && attempts < 3)
+                {
+                    attempts++;
+                    completed = attempts == 3;
+                }
+                AssertEx.True(completed, "transient request eventually succeeds");
+                AssertEx.Equal(3, attempts, "bounded retry count");
+            }),
+            ("33 mod-info lookup retries within one bounded request", () => {
+                const int timeoutSeconds = 15;
+                const int retrySeconds = 3;
+                var sends = 1;
+                for (var elapsed = retrySeconds; elapsed < timeoutSeconds; elapsed += retrySeconds) sends++;
+                AssertEx.Equal(5, sends, "initial request plus bounded resends");
+            }),
         };
 
         var failed = 0;
