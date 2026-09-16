@@ -1,4 +1,6 @@
-﻿namespace LabFusion.Network;
+﻿using LabFusion.Network.Proxy;
+
+namespace LabFusion.Network;
 
 public class SteamVRNetworkLayer : SteamNetworkLayer
 {
@@ -7,4 +9,10 @@ public class SteamVRNetworkLayer : SteamNetworkLayer
     public override uint ApplicationID => SteamVRId;
 
     public override string Title => "SteamVR";
+
+    public override bool TryGetFallback(out NetworkLayer fallback)
+    {
+        fallback = NetworkLayer.GetLayer<ProxySteamVRNetworkLayer>();
+        return fallback != null;
+    }
 }
