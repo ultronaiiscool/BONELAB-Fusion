@@ -36,23 +36,41 @@ jobs:
           export PATH="$RUNNER_TEMP/offline-dotnet:$PATH"
           dotnet restore LabFusion/LabFusion.csproj
 
-      - name: Package source, SDK, and NuGet cache
+      - name: Prepare split offline build kit
         shell: bash
         run: |
           set -euxo pipefail
-          rm -rf "$RUNNER_TEMP/offline-kit"
-          mkdir -p "$RUNNER_TEMP/offline-kit/source" "$RUNNER_TEMP/offline-kit/dotnet" "$RUNNER_TEMP/offline-kit/nuget-packages"
-          rsync -a --exclude='.git' ./ "$RUNNER_TEMP/offline-kit/source/"
-          rsync -a "$RUNNER_TEMP/offline-dotnet/" "$RUNNER_TEMP/offline-kit/dotnet/"
-          rsync -a "$HOME/.nuget/packages/" "$RUNNER_TEMP/offline-kit/nuget-packages/"
-          printf '%s\n' "${GITHUB_SHA}" > "$RUNNER_TEMP/offline-kit/COMMIT_SHA.txt"
-          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/fusion-offline-build-kit.tar.gz" offline-kit
-          ls -lh "$RUNNER_TEMP/fusion-offline-build-kit.tar.gz"
+          rm -rf "$RUNNER_TEMP/offline-source" "$RUNNER_TEMP/offline-sdk" "$RUNNER_TEMP/offline-nuget"
+          mkdir -p "$RUNNER_TEMP/offline-source/source" "$RUNNER_TEMP/offline-sdk/dotnet" "$RUNNER_TEMP/offline-nuget/nuget-packages"
+          rsync -a --exclude='.git' ./ "$RUNNER_TEMP/offline-source/source/"
+          printf '%s\n' "${GITHUB_SHA}" > "$RUNNER_TEMP/offline-source/COMMIT_SHA.txt"
+          rsync -a "$RUNNER_TEMP/offline-dotnet/" "$RUNNER_TEMP/offline-sdk/dotnet/"
+          rsync -a "$HOME/.nuget/packages/" "$RUNNER_TEMP/offline-nuget/nuget-packages/"
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/fusion-source.tar.gz" offline-source
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/dotnet6-sdk.tar.gz" offline-sdk
+          tar -C "$RUNNER_TEMP" -czf "$RUNNER_TEMP/nuget-cache.tar.gz" offline-nuget
+          ls -lh "$RUNNER_TEMP/fusion-source.tar.gz" "$RUNNER_TEMP/dotnet6-sdk.tar.gz" "$RUNNER_TEMP/nuget-cache.tar.gz"
 
-      - name: Upload offline build kit
+      - name: Upload source
         uses: actions/upload-artifact@v4
         with:
-          name: fusion-offline-build-kit
-          path: ${{ runner.temp }}/fusion-offline-build-kit.tar.gz
+          name: fusion-offline-source
+          path: ${{ runner.temp }}/fusion-source.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+      - name: Upload SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusion-offline-dotnet6
+          path: ${{ runner.temp }}/dotnet6-sdk.tar.gz
+          compression-level: 0
+          retention-days: 1
+
+      - name: Upload NuGet cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: fusion-offline-nuget
+          path: ${{ runner.temp }}/nuget-cache.tar.gz
           compression-level: 0
           retention-days: 1
